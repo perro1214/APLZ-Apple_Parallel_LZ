@@ -70,8 +70,9 @@ kernel void compress_chunk(
     if (base >= total_bytes) return;
     const uint clen = min(CHUNK_SIZE, total_bytes - base);
 
-    device LzToken* sparse  = out_sparse  + (uint64_t)gid * CHUNK_SIZE;
-    device LzToken* compact = out_compact + (uint64_t)gid * CHUNK_SIZE;
+    uint chunk_off = gid * CHUNK_SIZE;
+    device LzToken* sparse  = out_sparse  + chunk_off;
+    device LzToken* compact = out_compact + chunk_off;
 
     for (uint i = tid; i < HASH_SIZE; i += tg_size) {
         atomic_store_explicit(&ht_a[i], 0xFFFFFFFFu, memory_order_relaxed);
@@ -130,8 +131,9 @@ kernel void compress_chunk(
     // Step 2 (全スレッド): sparse → compact に直接書き込み (Step 3/4 不要)。
     threadgroup uint tg_starts[256];    // 各 tid の sparse 走査開始インデックス
     threadgroup uint tg_offsets[257];   // 各 tid の compact 書き込みオフセット (exclusive prefix-sum)
+    threadgroup uint tg_counts[256];
 
-    // Step 1: tid==0 が sparse を走査して担当区間とオフセットを計算
+    // Step 1a: tid==0 が sparse を走査して担当開始位置を決定
     if (tid == 0u) {
         uint total_tok = 0u;
         uint i = 0u;
@@ -144,7 +146,6 @@ kernel void compress_chunk(
         uint tok_count = 0u;
         uint cur_tid = 0u;
         tg_starts[0u] = 0u;
-        tg_offsets[0u] = 0u;
         i = 0u;
         while (i < clen) {
             tok_count++;
@@ -158,10 +159,33 @@ kernel void compress_chunk(
         }
         for (uint t = cur_tid + 1u; t < tg_size; t++) {
             tg_starts[t] = clen;
-            tg_offsets[t] = total_tok;
         }
-        tg_offsets[tg_size] = total_tok;
+        tg_counts[0] = total_tok;
         compact_cnt[gid] = total_tok;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 1b: 各スレッドの担当トークン数を数え、parallel prefix-sum で書き込みオフセットを作る
+    {
+        uint i = tg_starts[tid];
+        uint my_end = (tid + 1u < tg_size) ? tg_starts[tid + 1u] : clen;
+        uint local_cnt = 0u;
+        while (i < my_end) {
+            local_cnt++;
+            i += sparse[i].is_match ? uint(sparse[i].val) : 1u;
+        }
+        tg_counts[tid] = local_cnt;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = 1u; off < tg_size; off <<= 1u) {
+        uint add = (tid >= off) ? tg_counts[tid - off] : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tg_counts[tid] += add;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    tg_offsets[tid] = (tid == 0u) ? 0u : tg_counts[tid - 1u];
+    if (tid == tg_size - 1u) {
+        tg_offsets[tg_size] = tg_counts[tid];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -201,8 +225,8 @@ kernel void tans_encode(
     threadgroup SymInfo   tg_sym[N_SYMBOLS];  // 512 * 4 = 2048 bytes
     threadgroup uint16_t  tg_enc[ANS_L];      // 1024 * 2 = 2048 bytes
 
-    device const SymInfo*  my_sym = sym_arr + (uint64_t)gid * N_SYMBOLS;
-    device const uint16_t* my_enc = enc_arr + (uint64_t)gid * ANS_L;
+    device const SymInfo*  my_sym = sym_arr + gid * N_SYMBOLS;
+    device const uint16_t* my_enc = enc_arr + gid * ANS_L;
 
     for (uint i = tid; i < N_SYMBOLS; i += tg_size)
         tg_sym[i] = my_sym[i];
@@ -212,12 +236,12 @@ kernel void tans_encode(
 
     // ── エンコード ────────────────────────────────────────────────────────
     const uint n_tok = token_cnt[gid];
-    device const LzToken* ct = tokens + (uint64_t)gid * CHUNK_SIZE;
+    device const LzToken* ct = tokens + gid * CHUNK_SIZE;
     uint state   = ANS_L;
     uint bit_buf = 0u;
     uint bit_cnt = 0u;
 
-    device uint8_t* my_out = bs_out + ((uint64_t)gid * tg_size + tid) * BS_CAP;
+    device uint8_t* my_out = bs_out + ((gid * tg_size + tid) * BS_CAP);
     uint bp = 0u;
 
     for (uint i = tid; i < n_tok; i += tg_size) {
@@ -290,7 +314,7 @@ kernel void tans_decode(
     // ── Per-chunk デコードテーブルを threadgroup メモリにロード ────────────
     threadgroup DecodeEntry tg_dec[ANS_L];  // 1024 * 8 = 8192 bytes
 
-    device const DecodeEntry* my_dec = dec_arr + (uint64_t)gid * ANS_L;
+    device const DecodeEntry* my_dec = dec_arr + gid * ANS_L;
     for (uint i = tid; i < ANS_L; i += tg_size)
         tg_dec[i] = my_dec[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -306,7 +330,7 @@ kernel void tans_decode(
 
     uint stream_idx = gid * tg_size + tid;
     uint bp = bs_sizes[stream_idx];
-    device const uint8_t* my_in = bs_in + (uint64_t)stream_idx * BS_CAP;
+    device const uint8_t* my_in = bs_in + stream_idx * BS_CAP;
     if (bp < 2u || bp > BS_CAP) {
         atomic_store_explicit(&ans_err[gid], 1u, memory_order_relaxed);
         return;
@@ -326,7 +350,7 @@ kernel void tans_decode(
         bit_pos = int((data_bytes - 1u) * 8u + sentinel_pos) - 1;
     }
 
-    device LzToken* chunk_out = out_tokens + (uint64_t)gid * CHUNK_SIZE;
+    device LzToken* chunk_out = out_tokens + gid * CHUNK_SIZE;
 
     for (int t = int(my_count) - 1; t >= 0; t--) {
         if (state < ANS_L || state >= 2u * ANS_L) {
@@ -425,35 +449,60 @@ kernel void lz77_decode(
     const uint clen = min(CHUNK_SIZE, total_bytes - base);
     const uint n_tok = token_cnt[gid];
 
-    device const LzToken* ct = tokens + (uint64_t)gid * CHUNK_SIZE;
+    device const LzToken* ct = tokens + gid * CHUNK_SIZE;
     device uint8_t* out = out_data + base;
 
-    // ── Phase A (tid==0): バリデーション + リテラル即時書き込み ──────────
+    // ── Phase A: タイル単位 parallel prefix-scan でバリデーション + リテラル書き込み ──
     threadgroup uint tg_invalid;
+    threadgroup uint tg_tile_scan[256];
+    threadgroup uint tg_pos_base;
     if (tid == 0u)
-        tg_invalid = 0u;
+        { tg_invalid = 0u; tg_pos_base = 0u; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0u) {
-        uint pos = 0u;
-        for (uint i = 0u; i < n_tok && pos < clen; i++) {
-            if (ct[i].is_match) {
-                uint len = uint(ct[i].val), dist = uint(ct[i].dist);
-                if (len == 0u || dist == 0u || dist > pos || pos + len > clen) {
+    for (uint tile = 0u; tile < n_tok; tile += tg_size) {
+        uint idx = tile + tid;
+        uint step = 0u;
+        bool is_match = false;
+        uint val = 0u, dist = 0u;
+        if (idx < n_tok) {
+            LzToken tok = ct[idx];
+            is_match = tok.is_match != 0;
+            val = uint(tok.val);
+            dist = uint(tok.dist);
+            step = is_match ? val : 1u;
+        }
+        tg_tile_scan[tid] = step;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint off = 1u; off < tg_size; off <<= 1u) {
+            uint add = (tid >= off) ? tg_tile_scan[tid - off] : 0u;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            tg_tile_scan[tid] += add;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        uint pos_before = tg_pos_base + tg_tile_scan[tid] - step;
+        if (idx < n_tok) {
+            if (is_match) {
+                uint len = val;
+                if (len == 0u || dist == 0u || dist > pos_before || pos_before + len > clen) {
                     tg_invalid = 1u;
-                    break;
                 }
-                pos += len;
             } else {
-                out[pos] = uint8_t(ct[i].val);
-                pos += 1u;
+                if (pos_before >= clen) tg_invalid = 1u;
+                else out[pos_before] = uint8_t(val);
             }
         }
-        if (tg_invalid == 0u && pos != clen)
-            tg_invalid = 1u;
-        if (tg_invalid != 0u)
-            atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+        if (tid == tg_size - 1u) tg_pos_base += tg_tile_scan[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tg_invalid != 0u) break;
     }
+    if (tid == 0u && tg_pos_base != clen)
+        tg_invalid = 1u;
+    if (tid == 0u && tg_invalid != 0u)
+        atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     if (tg_invalid != 0u)

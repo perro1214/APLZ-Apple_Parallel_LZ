@@ -23,8 +23,15 @@
 #include <algorithm>
 #include <dispatch/dispatch.h>
 #include <limits>
+#include <memory>
+#include <array>
 
 #include "APLZ.h"
+
+// ─── デバッグフラグ ────────────────────────────────────────────────────────────
+static bool g_debug = false;
+#define DLOG(fmt, ...) \
+    do { if (g_debug) fprintf(stderr, "[APLZ DBG] " fmt "\n", ##__VA_ARGS__); } while(0)
 
 // ─── ローカルエイリアス ────────────────────────────────────────────────────────
 static const uint32_t CHUNK_SIZE  = APLZ_CHUNK_SIZE;
@@ -45,6 +52,18 @@ static const uint32_t N_BUFS            = 2;
 
 static id<MTLLibrary> compile_shader(id<MTLDevice> dev, const char* path) {
     NSError* err = nil;
+    NSString* src_path = @(path);
+    NSString* metallib_path = [[src_path stringByDeletingPathExtension] stringByAppendingPathExtension:@"metallib"];
+    NSURL* metallib_url = [NSURL fileURLWithPath:metallib_path];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:metallib_path]) {
+        id<MTLLibrary> prebuilt = [dev newLibraryWithURL:metallib_url error:&err];
+        if (prebuilt) {
+            DLOG("[shader] loaded prebuilt metallib: %s", metallib_path.UTF8String);
+            return prebuilt;
+        }
+        DLOG("[shader] metallib load failed (%s), fallback to source compile",
+             err.localizedDescription.UTF8String);
+    }
     NSString* src = [NSString stringWithContentsOfFile:@(path)
                                               encoding:NSUTF8StringEncoding
                                                  error:&err];
@@ -167,50 +186,41 @@ static void build_decode_table(const SymInfo* si, const uint16_t* spread,
 
 // ─── コンパクト頻度テーブル シリアライズ/デシリアライズ ─────────────────────────
 // format: uint16_t n_nonzero, [uint16_t symbol_id, uint16_t freq] × n_nonzero
-static void write_compact_freq(FILE* f, const SymInfo* si) {
+static void append_compact_freq(std::vector<uint8_t>& out, const SymInfo* si) {
     uint16_t n_nz = 0;
-    for (uint32_t i = 0; i < N_SYMBOLS; i++)
+    for (uint32_t i = 0; i < N_SYMBOLS; i++) {
         if (si[i].freq > 0) n_nz++;
-    fwrite(&n_nz, 2, 1, f);
+    }
+    size_t base = out.size();
+    out.resize(base + 2 + (size_t)n_nz * 4);
+    memcpy(out.data() + base, &n_nz, 2);
+    size_t p = base + 2;
     for (uint32_t i = 0; i < N_SYMBOLS; i++) {
         if (si[i].freq > 0) {
             uint16_t sym = (uint16_t)i;
-            fwrite(&sym, 2, 1, f);
-            fwrite(&si[i].freq, 2, 1, f);
+            memcpy(out.data() + p, &sym, 2);
+            memcpy(out.data() + p + 2, &si[i].freq, 2);
+            p += 4;
         }
     }
 }
 
-static bool read_compact_freq(FILE* f, SymInfo* si) {
+static bool read_compact_freq_mem(const uint8_t*& p, const uint8_t* end, SymInfo* si) {
     memset(si, 0, N_SYMBOLS * sizeof(SymInfo));
+    if ((size_t)(end - p) < 2) return false;
     uint16_t n_nz;
-    if (fread(&n_nz, 2, 1, f) != 1) {
-        fprintf(stderr, "[APLZ] read_compact_freq: failed to read n_nonzero\n");
-        return false;
-    }
-    if (n_nz > N_SYMBOLS) {
-        fprintf(stderr, "[APLZ] read_compact_freq: n_nonzero %u exceeds N_SYMBOLS %u\n",
-                (unsigned)n_nz, (unsigned)N_SYMBOLS);
-        return false;
-    }
+    memcpy(&n_nz, p, 2);
+    p += 2;
+    if (n_nz > N_SYMBOLS) return false;
+    if ((size_t)(end - p) < (size_t)n_nz * 4) return false;
     for (uint16_t i = 0; i < n_nz; i++) {
         uint16_t sym, freq;
-        if (fread(&sym, 2, 1, f) != 1) {
-            fprintf(stderr, "[APLZ] read_compact_freq: failed to read symbol at entry %u\n", (unsigned)i);
-            return false;
-        }
-        if (sym >= N_SYMBOLS) {
-            fprintf(stderr, "[APLZ] read_compact_freq: symbol %u out of range (>= %u)\n",
-                    (unsigned)sym, (unsigned)N_SYMBOLS);
-            return false;
-        }
-        if (fread(&freq, 2, 1, f) != 1) {
-            fprintf(stderr, "[APLZ] read_compact_freq: failed to read freq at entry %u\n", (unsigned)i);
-            return false;
-        }
+        memcpy(&sym, p, 2);
+        memcpy(&freq, p + 2, 2);
+        p += 4;
+        if (sym >= N_SYMBOLS) return false;
         si[sym].freq = freq;
     }
-    // cum_freq を再計算
     uint16_t cum = 0;
     for (uint32_t i = 0; i < N_SYMBOLS; i++) {
         si[i].cum_freq = cum;
@@ -314,11 +324,14 @@ static int compress(const char* in_path, const char* out_path, const char* shade
     const size_t sz_tok_mb = (size_t)mb_chunks * CHUNK_SIZE * sizeof(LzToken);
     const size_t sz_cnt_mb = (size_t)mb_chunks * sizeof(uint32_t);
 
-    id<MTLBuffer> buf_sparse  = [dev newBufferWithLength:sz_tok_mb options:MTLResourceStorageModeShared];
-    id<MTLBuffer> buf_compact = [dev newBufferWithLength:sz_tok_mb options:MTLResourceStorageModeShared];
-    id<MTLBuffer> buf_cnt     = [dev newBufferWithLength:sz_cnt_mb options:MTLResourceStorageModeShared];
-
-    if (!buf_sparse || !buf_compact || !buf_cnt) {
+    id<MTLBuffer> pass1_sparse[N_BUFS], pass1_compact[N_BUFS], pass1_cnt[N_BUFS];
+    for (uint32_t s = 0; s < N_BUFS; s++) {
+        pass1_sparse[s]  = [dev newBufferWithLength:sz_tok_mb options:MTLResourceStorageModePrivate];
+        pass1_compact[s] = [dev newBufferWithLength:sz_tok_mb options:MTLResourceStorageModeShared];
+        pass1_cnt[s]     = [dev newBufferWithLength:sz_cnt_mb options:MTLResourceStorageModeShared];
+    }
+    if (!pass1_sparse[0] || !pass1_sparse[1] || !pass1_compact[0] || !pass1_compact[1] ||
+        !pass1_cnt[0] || !pass1_cnt[1]) {
         fprintf(stderr, "[APLZ] Buffer alloc failed.\n"); return EXIT_FAILURE;
     }
 
@@ -361,6 +374,7 @@ static int compress(const char* in_path, const char* out_path, const char* shade
     std::string tmp_path = std::string(out_path) + ".tmp";
     FILE* fout = fopen(tmp_path.c_str(), "wb");
     if (!fout) { perror("fopen"); return EXIT_FAILURE; }
+    setvbuf(fout, nullptr, _IOFBF, 4 * 1024 * 1024);
 
     FileHeader hdr;
     memcpy(hdr.magic, "APLZ", 4);
@@ -393,20 +407,33 @@ static int compress(const char* in_path, const char* out_path, const char* shade
 
     CFTimeInterval t_pipe_start = CACurrentMediaTime();
 
+    dispatch_semaphore_t pass1_sem[N_BUFS] = {};
+    for (uint32_t mb = 0; mb < std::min(n_mega, N_BUFS); mb++) {
+        uint32_t sl = mb % N_BUFS;
+        uint32_t mc_start = mb * mb_chunks;
+        uint32_t mc_count = std::min(mb_chunks, num_chunks - mc_start);
+        pass1_sem[sl] = dispatch_pass1(cq, pso1, buf_in, pass1_sparse[sl], pass1_compact[sl], pass1_cnt[sl],
+                                       mc_start, mc_count, file_size);
+    }
     for (uint32_t mb = 0; mb < n_mega; mb++) {
         uint32_t mc_start = mb * mb_chunks;
         uint32_t mc_count = std::min(mb_chunks, num_chunks - mc_start);
-
-        // ── GPU Pass1 (非同期ディスパッチ) ────────────────────────────────
-        dispatch_semaphore_t pass1_sem = dispatch_pass1(
-            cq, pso1, buf_in, buf_sparse, buf_compact, buf_cnt,
-            mc_start, mc_count, file_size);
+        uint32_t sl_mb = mb % N_BUFS;
 
         // Pass1 完了を待機してから CPU でバッファを参照
-        dispatch_semaphore_wait(pass1_sem, DISPATCH_TIME_FOREVER);
+        dispatch_semaphore_wait(pass1_sem[sl_mb], DISPATCH_TIME_FOREVER);
+        uint32_t mb_prefetch = mb + N_BUFS;
+        if (mb_prefetch < n_mega) {
+            uint32_t sl_pf = mb_prefetch % N_BUFS;
+            uint32_t pf_start = mb_prefetch * mb_chunks;
+            uint32_t pf_count = std::min(mb_chunks, num_chunks - pf_start);
+            pass1_sem[sl_pf] = dispatch_pass1(cq, pso1, buf_in, pass1_sparse[sl_pf], pass1_compact[sl_pf], pass1_cnt[sl_pf],
+                                              pf_start, pf_count, file_size);
+        }
+        DLOG("[compress] mega-batch %u/%u: mc_start=%u mc_count=%u", mb, n_mega, mc_start, mc_count);
 
-        const LzToken*  compact_ptr = (const LzToken*)buf_compact.contents;
-        const uint32_t* cnt_ptr     = (const uint32_t*)buf_cnt.contents;
+        const LzToken*  compact_ptr = (const LzToken*)pass1_compact[sl_mb].contents;
+        const uint32_t* cnt_ptr     = (const uint32_t*)pass1_cnt[sl_mb].contents;
 
         // カウント収集
         for (uint32_t c = 0; c < mc_count; c++) {
@@ -421,13 +448,15 @@ static int compress(const char* in_path, const char* out_path, const char* shade
         // 全メガバッチ分の SymInfo を保持 (ファイル書き出しに必要)
         std::vector<SymInfo> mb_sym_infos(mc_count * N_SYMBOLS);
 
-        uint32_t raw_freq[N_SYMBOLS];
-        uint16_t spread[ANS_L];
-
         for (uint32_t c = 0; c < mc_count; c++) {
             SymInfo* si = &mb_sym_infos[c * N_SYMBOLS];
-            total_matches += compute_chunk_histogram(
+            uint32_t raw_freq[N_SYMBOLS];
+            uint32_t chunk_matches = compute_chunk_histogram(
                 compact_ptr + (uint64_t)c * CHUNK_SIZE, cnt_ptr[c], raw_freq);
+            total_matches += chunk_matches;
+            DLOG("  chunk %u: tokens=%u matches=%u (%.1f%%)",
+                 mc_start + c, cnt_ptr[c], chunk_matches,
+                 cnt_ptr[c] ? 100.0 * chunk_matches / cnt_ptr[c] : 0.0);
             normalize_histogram(raw_freq, si);
         }
 
@@ -440,27 +469,27 @@ static int compress(const char* in_path, const char* out_path, const char* shade
             uint32_t lc_start = b * BATCH_CHUNKS;
             uint32_t lc_count = std::min(BATCH_CHUNKS, mc_count - lc_start);
             uint32_t gc_start = mc_start + lc_start;
+            DLOG("  [compress] batch %u/%u slot=%u gc=%u..%u",
+                 b, mb_n_batches, sl, gc_start, gc_start + lc_count - 1);
 
             // Per-chunk テーブルをスロットバッファにコピー
             SymInfo*  sym_dst = (SymInfo*)slot_sym[sl].contents;
             uint16_t* enc_dst = (uint16_t*)slot_enc[sl].contents;
-
-            for (uint32_t lc = 0; lc < lc_count; lc++) {
-                SymInfo* si = &mb_sym_infos[(lc_start + lc) * N_SYMBOLS];
+            dispatch_apply(lc_count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t ilc) {
+                uint32_t lc = (uint32_t)ilc;
+                const SymInfo* si = &mb_sym_infos[(lc_start + lc) * N_SYMBOLS];
                 memcpy(sym_dst + (size_t)lc * N_SYMBOLS, si, N_SYMBOLS * sizeof(SymInfo));
-
-                build_spread_table(si, spread);
+                uint16_t spread_local[ANS_L];
+                build_spread_table(si, spread_local);
                 uint16_t* enc = enc_dst + (size_t)lc * ANS_L;
-                build_encode_table(si, spread, enc);
-            }
-
-            memset(slot_bs[sl].contents, 0, (size_t)lc_count * N_STREAMS * BS_CAP);
+                build_encode_table(si, spread_local, enc);
+            });
 
             id<MTLCommandBuffer> cb = [cq commandBuffer];
             id<MTLComputeCommandEncoder> enc2 = [cb computeCommandEncoder];
             [enc2 setComputePipelineState:pso2];
-            [enc2 setBuffer:buf_compact    offset:(size_t)lc_start * CHUNK_SIZE * sizeof(LzToken) atIndex:0];
-            [enc2 setBuffer:buf_cnt        offset:(size_t)lc_start * sizeof(uint32_t)             atIndex:1];
+            [enc2 setBuffer:pass1_compact[sl_mb] offset:(size_t)lc_start * CHUNK_SIZE * sizeof(LzToken) atIndex:0];
+            [enc2 setBuffer:pass1_cnt[sl_mb]     offset:(size_t)lc_start * sizeof(uint32_t)             atIndex:1];
             [enc2 setBuffer:slot_sym[sl]   offset:0 atIndex:2];
             [enc2 setBuffer:slot_enc[sl]   offset:0 atIndex:3];
             [enc2 setBuffer:slot_bs[sl]    offset:0 atIndex:4];
@@ -474,11 +503,11 @@ static int compress(const char* in_path, const char* out_path, const char* shade
             id<MTLBuffer> cap_bsz = slot_bsz[sl];
             uint32_t cap_gc_start = gc_start;
             uint32_t cap_lc_count = lc_count;
-            std::vector<uint32_t> cap_cnt(mb_cnt.begin() + lc_start,
-                                          mb_cnt.begin() + lc_start + lc_count);
-            // per-chunk SymInfo のキャプチャ (ファイル書き出し用)
-            std::vector<SymInfo> cap_sym(mb_sym_infos.begin() + lc_start * N_SYMBOLS,
-                                         mb_sym_infos.begin() + (lc_start + lc_count) * N_SYMBOLS);
+            std::shared_ptr<std::vector<uint32_t>> cap_cnt = std::make_shared<std::vector<uint32_t>>(
+                mb_cnt.begin() + lc_start, mb_cnt.begin() + lc_start + lc_count);
+            std::shared_ptr<std::vector<SymInfo>> cap_sym = std::make_shared<std::vector<SymInfo>>(
+                mb_sym_infos.begin() + lc_start * N_SYMBOLS,
+                mb_sym_infos.begin() + (lc_start + lc_count) * N_SYMBOLS);
 
             dispatch_group_enter(done_grp);
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
@@ -490,12 +519,16 @@ static int compress(const char* in_path, const char* out_path, const char* shade
                         uint32_t gc = cap_gc_start + lc;
                         offs_ptr[gc] = (uint64_t)ftell(fout);
 
-                        uint32_t tc = cap_cnt[lc];
-                        fwrite(&tc, 4, 1, fout);
+                        std::vector<uint8_t> chunk_blob;
+                        chunk_blob.reserve(4096);
 
-                        // per-chunk 頻度テーブル (コンパクト形式)
-                        const SymInfo* si = &cap_sym[lc * N_SYMBOLS];
-                        write_compact_freq(fout, si);
+                        uint32_t tc = (*cap_cnt)[lc];
+                        chunk_blob.insert(chunk_blob.end(),
+                                          (const uint8_t*)&tc,
+                                          (const uint8_t*)&tc + sizeof(uint32_t));
+
+                        const SymInfo* si = &(*cap_sym)[lc * N_SYMBOLS];
+                        append_compact_freq(chunk_blob, si);
 
                         // stream sizes + data (coalesced payload write)
                         uint16_t ssz[256];
@@ -504,7 +537,9 @@ static int compress(const char* in_path, const char* out_path, const char* shade
                             ssz[s] = (uint16_t)bsz[(size_t)lc * 256 + s];
                             payload_size += ssz[s];
                         }
-                        fwrite(ssz, 2, 256, fout);
+                        chunk_blob.insert(chunk_blob.end(),
+                                          (const uint8_t*)ssz,
+                                          (const uint8_t*)ssz + sizeof(ssz));
 
                         std::vector<uint8_t> payload(payload_size);
                         size_t off = 0;
@@ -515,7 +550,8 @@ static int compress(const char* in_path, const char* out_path, const char* shade
                                 off += ssz[s];
                             }
                         }
-                        fwrite(payload.data(), 1, payload_size, fout);
+                        chunk_blob.insert(chunk_blob.end(), payload.begin(), payload.end());
+                        fwrite(chunk_blob.data(), 1, chunk_blob.size(), fout);
                     }
 
                     dispatch_semaphore_signal(buf_sem);
@@ -552,9 +588,6 @@ static int compress(const char* in_path, const char* out_path, const char* shade
         return EXIT_FAILURE;
     }
 
-    // sparse バッファ解放
-    buf_sparse = nil;
-
     CFTimeInterval t_total_end = CACurrentMediaTime();
     double total_ms  = (t_total_end - t_total_start) * 1000.0;
     double throughput = (file_size / (1024.0 * 1024.0)) / (t_total_end - t_total_start);
@@ -574,27 +607,44 @@ static int compress(const char* in_path, const char* out_path, const char* shade
 // 解凍モード (-d) v3 — Per-chunk tANS
 // ═══════════════════════════════════════════════════════════════════════════════
 static int decompress(const char* in_path, const char* out_path, const char* shader_path) {
-    FILE* f = fopen(in_path, "rb");
-    if (!f) { perror("fopen"); return EXIT_FAILURE; }
+    int fd = open(in_path, O_RDONLY);
+    if (fd < 0) { perror("open"); return EXIT_FAILURE; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { perror("fstat"); close(fd); return EXIT_FAILURE; }
+    size_t in_size = (size_t)st.st_size;
+    void* mapped = mmap(nullptr, in_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) { perror("mmap"); close(fd); return EXIT_FAILURE; }
+    madvise(mapped, in_size, MADV_SEQUENTIAL);
+    const uint8_t* file_base = (const uint8_t*)mapped;
+    const uint8_t* p = file_base;
+    const uint8_t* file_end = file_base + in_size;
 
     FileHeader hdr;
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
-        fprintf(stderr, "[APLZ] Failed to read header.\n"); fclose(f); return EXIT_FAILURE;
+    if ((size_t)(file_end - p) < sizeof(hdr)) {
+        fprintf(stderr, "[APLZ] Failed to read header.\n");
+        munmap(mapped, in_size); close(fd); return EXIT_FAILURE;
     }
+    memcpy(&hdr, p, sizeof(hdr));
+    p += sizeof(hdr);
     if (memcmp(hdr.magic, "APLZ", 4) != 0) {
-        fprintf(stderr, "[APLZ] Not an APLZ file.\n"); fclose(f); return EXIT_FAILURE;
+        fprintf(stderr, "[APLZ] Not an APLZ file.\n");
+        munmap(mapped, in_size); close(fd); return EXIT_FAILURE;
     }
 
     uint32_t ns, al;
-    if (fread(&ns, 4, 1, f) != 1 || fread(&al, 4, 1, f) != 1) {
+    if ((size_t)(file_end - p) < 8) {
         fprintf(stderr, "[APLZ] Failed to read n_streams/ans_log_l.\n");
-        fclose(f); return EXIT_FAILURE;
+        munmap(mapped, in_size); close(fd); return EXIT_FAILURE;
     }
+    memcpy(&ns, p, 4); p += 4;
+    memcpy(&al, p, 4); p += 4;
 
     // v3: グローバル SymInfo はない。v2 互換のためバージョンチェック。
     if (hdr.version == 2) {
-        // v2: グローバルテーブルを読み飛ばす
-        fseek(f, N_SYMBOLS * sizeof(SymInfo), SEEK_CUR);
+        if ((size_t)(file_end - p) < N_SYMBOLS * sizeof(SymInfo)) {
+            munmap(mapped, in_size); close(fd); return EXIT_FAILURE;
+        }
+        p += N_SYMBOLS * sizeof(SymInfo);
     }
 
     const uint32_t num_chunks = hdr.num_chunks;
@@ -602,40 +652,39 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
 
     // 空ファイル: 0バイトの出力ファイルを作成して正常終了
     if (num_chunks == 0 && original_size == 0) {
-        fclose(f);
         FILE* fout = fopen(out_path, "wb");
         if (!fout) { perror("fopen"); return EXIT_FAILURE; }
         fclose(fout);
+        munmap(mapped, in_size);
+        close(fd);
         printf("[APLZ] Empty archive → %s (0 bytes)\n", out_path);
         return EXIT_SUCCESS;
     }
 
     std::vector<uint64_t> chunk_offsets(num_chunks);
-    if (fread(chunk_offsets.data(), 8, num_chunks, f) != num_chunks) {
+    if ((size_t)(file_end - p) < (size_t)num_chunks * 8) {
         fprintf(stderr, "[APLZ] Failed to read chunk_offsets table.\n");
-        fclose(f); return EXIT_FAILURE;
+        munmap(mapped, in_size); close(fd); return EXIT_FAILURE;
     }
+    memcpy(chunk_offsets.data(), p, (size_t)num_chunks * 8);
+    p += (size_t)num_chunks * 8;
 
     // chunk_offsets バリデーション
     {
-        // ファイルサイズ取得
-        long saved_pos = ftell(f);
-        if (fseek(f, 0, SEEK_END) != 0) { perror("fseek"); fclose(f); return EXIT_FAILURE; }
-        uint64_t file_sz = (uint64_t)ftell(f);
-        if (fseek(f, saved_pos, SEEK_SET) != 0) { perror("fseek"); fclose(f); return EXIT_FAILURE; }
+        uint64_t file_sz = (uint64_t)in_size;
 
         for (uint32_t ci = 0; ci < num_chunks; ci++) {
             if (chunk_offsets[ci] >= file_sz) {
                 fprintf(stderr, "[APLZ] chunk_offsets[%u]=%llu is out of file bounds (%llu).\n",
                         ci, (unsigned long long)chunk_offsets[ci], (unsigned long long)file_sz);
-                fclose(f); return EXIT_FAILURE;
+                munmap(mapped, in_size); close(fd); return EXIT_FAILURE;
             }
             if (ci > 0 && chunk_offsets[ci] <= chunk_offsets[ci - 1]) {
                 fprintf(stderr, "[APLZ] chunk_offsets not monotonically increasing at index %u "
                         "(%llu <= %llu).\n",
                         ci, (unsigned long long)chunk_offsets[ci],
                         (unsigned long long)chunk_offsets[ci - 1]);
-                fclose(f); return EXIT_FAILURE;
+                munmap(mapped, in_size); close(fd); return EXIT_FAILURE;
             }
         }
     }
@@ -647,7 +696,7 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
 
     // Metal セットアップ
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    if (!dev) { fprintf(stderr, "[APLZ] Metal unavailable.\n"); fclose(f); return EXIT_FAILURE; }
+    if (!dev) { fprintf(stderr, "[APLZ] Metal unavailable.\n"); munmap(mapped, in_size); close(fd); return EXIT_FAILURE; }
     printf("[APLZ] Device    : %s\n", dev.name.UTF8String);
     id<MTLCommandQueue> cq = [dev newCommandQueue];
     id<MTLLibrary> lib = compile_shader(dev, shader_path);
@@ -669,12 +718,14 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
         return EXIT_FAILURE;
     }
 
-    // 出力バッファ (メガバッチサイズ)
+    // 出力バッファ (メガバッチサイズ, メガバッチ間ダブルバッファ)
     const uint32_t mb_chunks = std::min((uint32_t)MEGA_BATCH_CHUNKS, num_chunks);
     const size_t mb_out_size = (size_t)mb_chunks * CHUNK_SIZE;
-    id<MTLBuffer> buf_out = [dev newBufferWithLength:mb_out_size
-                                             options:MTLResourceStorageModeShared];
-    if (!buf_out) {
+    id<MTLBuffer> mb_out[N_BUFS];
+    for (uint32_t s = 0; s < N_BUFS; s++) {
+        mb_out[s] = [dev newBufferWithLength:mb_out_size options:MTLResourceStorageModeShared];
+    }
+    if (!mb_out[0] || !mb_out[1]) {
         fprintf(stderr, "[APLZ] Output buffer alloc failed.\n"); return EXIT_FAILURE;
     }
 
@@ -689,7 +740,7 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
         slot_tcnt[s] = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * sizeof(uint32_t)
                                          options:MTLResourceStorageModeShared];
         slot_tok[s]  = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * CHUNK_SIZE * sizeof(LzToken)
-                                         options:MTLResourceStorageModeShared];
+                                         options:MTLResourceStorageModePrivate];
         slot_dec[s]  = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * ANS_L * sizeof(DecodeEntry)
                                          options:MTLResourceStorageModeShared];
         slot_anserr[s] = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * sizeof(uint32_t)
@@ -702,8 +753,12 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
     if (!fout) { perror("fopen"); return EXIT_FAILURE; }
 
     dispatch_semaphore_t buf_sem = dispatch_semaphore_create(N_BUFS);
+    dispatch_semaphore_t out_sem = dispatch_semaphore_create(N_BUFS);
     dispatch_group_t done_grp = dispatch_group_create();
+    dispatch_group_t write_grp = dispatch_group_create();
+    dispatch_queue_t write_q = dispatch_queue_create("aplz.decompress.write", DISPATCH_QUEUE_SERIAL);
     __block bool decode_failed = false;
+    __block bool write_failed = false;
 
     uint32_t n_mega = (num_chunks + mb_chunks - 1) / mb_chunks;
     uint32_t total_batches = (num_chunks + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
@@ -712,14 +767,17 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
 
     CFTimeInterval t_total_start = CACurrentMediaTime();
 
-    SymInfo chunk_si[N_SYMBOLS];
-    uint16_t spread[ANS_L];
+    std::vector<SymInfo> mb_chunk_si((size_t)BATCH_CHUNKS * N_SYMBOLS);
 
     for (uint32_t mb = 0; mb < n_mega; mb++) {
+        dispatch_semaphore_wait(out_sem, DISPATCH_TIME_FOREVER);
+        uint32_t mb_out_slot = mb % N_BUFS;
         uint32_t mc_start = mb * mb_chunks;
         uint32_t mc_count = std::min(mb_chunks, num_chunks - mc_start);
 
         uint32_t mb_n_batches = (mc_count + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
+        DLOG("[decompress] mega-batch %u/%u: mc_start=%u mc_count=%u",
+             mb, n_mega, mc_start, mc_count);
 
         for (uint32_t b = 0; b < mb_n_batches; b++) {
             if (decode_failed) break;
@@ -729,6 +787,8 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
             uint32_t lc_start = b * BATCH_CHUNKS;
             uint32_t lc_count = std::min(BATCH_CHUNKS, mc_count - lc_start);
             uint32_t gc_start = mc_start + lc_start;
+            DLOG("  [decompress] batch %u/%u slot=%u gc=%u..%u",
+                 b, mb_n_batches, sl, gc_start, gc_start + lc_count - 1);
 
             uint8_t*  bs_data   = (uint8_t*)slot_bs[sl].contents;
             uint32_t* bsz_data  = (uint32_t*)slot_bsz[sl].contents;
@@ -741,22 +801,28 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
             memset(anserr_data, 0, (size_t)lc_count * sizeof(uint32_t));
             memset(lzerr_data, 0, (size_t)lc_count * sizeof(uint32_t));
 
+            const size_t stream_read_cap = (size_t)N_STREAMS * BS_CAP;
+
             for (uint32_t lc = 0; lc < lc_count; lc++) {
                 uint32_t gc = gc_start + lc;
-                if (fseek(f, (long)chunk_offsets[gc], SEEK_SET) != 0) {
-                    perror("[APLZ] fseek chunk_offsets");
-                    fclose(f); fclose(fout); unlink(out_path); return EXIT_FAILURE;
+                const uint8_t* cp = file_base + chunk_offsets[gc];
+                if (cp >= file_end) {
+                    fprintf(stderr, "[APLZ] Chunk pointer OOB at chunk %u\n", gc);
+                    munmap(mapped, in_size); close(fd); fclose(fout); unlink(out_path); return EXIT_FAILURE;
                 }
-                if (fread(&tcnt_data[lc], 4, 1, f) != 1) {
+                if ((size_t)(file_end - cp) < 4) {
                     fprintf(stderr, "[APLZ] Failed to read token_cnt at chunk %u\n", gc);
-                    fclose(f); fclose(fout); unlink(out_path); return EXIT_FAILURE;
+                    munmap(mapped, in_size); close(fd); fclose(fout); unlink(out_path); return EXIT_FAILURE;
                 }
+                memcpy(&tcnt_data[lc], cp, 4);
+                cp += 4;
 
                 // per-chunk 頻度テーブル読み込み + デコードテーブル構築
                 if (hdr.version >= 3) {
-                    if (!read_compact_freq(f, chunk_si)) {
+                    SymInfo* chunk_si = mb_chunk_si.data() + (size_t)lc * N_SYMBOLS;
+                    if (!read_compact_freq_mem(cp, file_end, chunk_si)) {
                         fprintf(stderr, "[APLZ] Corrupt compact_freq at chunk %u\n", gc);
-                        fclose(f); fclose(fout); unlink(out_path);
+                        munmap(mapped, in_size); close(fd); fclose(fout); unlink(out_path);
                         return EXIT_FAILURE;
                     }
                 } else {
@@ -764,28 +830,42 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                     // (v2ファイルはこのコードパスに来ないはず)
                 }
 
-                build_spread_table(chunk_si, spread);
-                build_decode_table(chunk_si, spread, dec_data + (size_t)lc * ANS_L);
-
                 uint16_t ssz[256];
-                if (fread(ssz, 2, 256, f) != 256) {
+                if ((size_t)(file_end - cp) < sizeof(ssz)) {
                     fprintf(stderr, "[APLZ] Failed to read stream sizes at chunk %u\n", gc);
-                    fclose(f); fclose(fout); unlink(out_path); return EXIT_FAILURE;
+                    munmap(mapped, in_size); close(fd); fclose(fout); unlink(out_path); return EXIT_FAILURE;
                 }
+                memcpy(ssz, cp, sizeof(ssz));
+                cp += sizeof(ssz);
                 size_t stream_total = 0;
                 for (uint32_t s = 0; s < 256; s++) stream_total += ssz[s];
-                std::vector<uint8_t> stream_buf(stream_total);
-                if (stream_total > 0 && fread(stream_buf.data(), 1, stream_total, f) != stream_total) {
-                    fprintf(stderr, "[APLZ] Failed to read stream data at chunk %u\n", gc);
-                    fclose(f); fclose(fout); unlink(out_path); return EXIT_FAILURE;
+                if (stream_total > stream_read_cap) {
+                    fprintf(stderr, "[APLZ] Stream payload too large at chunk %u (%zu > %zu)\n",
+                            gc, stream_total, stream_read_cap);
+                    munmap(mapped, in_size); close(fd); fclose(fout); unlink(out_path); return EXIT_FAILURE;
                 }
-                const uint8_t* src = stream_buf.data();
+                if ((size_t)(file_end - cp) < stream_total) {
+                    fprintf(stderr, "[APLZ] Failed to read stream data at chunk %u\n", gc);
+                    munmap(mapped, in_size); close(fd); fclose(fout); unlink(out_path); return EXIT_FAILURE;
+                }
+                DLOG("    chunk %u: token_cnt=%u stream_total=%zu bytes",
+                     gc, tcnt_data[lc], stream_total);
+                const uint8_t* src = cp;
                 for (uint32_t s = 0; s < 256; s++) {
                     bsz_data[(size_t)lc * 256 + s] = (uint32_t)ssz[s];
                     memcpy(bs_data + ((size_t)lc * 256 + s) * BS_CAP, src, ssz[s]);
                     src += ssz[s];
                 }
+                cp += stream_total;
             }
+
+            dispatch_apply(lc_count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t ilc) {
+                uint32_t lc = (uint32_t)ilc;
+                const SymInfo* chunk_si = mb_chunk_si.data() + (size_t)lc * N_SYMBOLS;
+                uint16_t spread_local[ANS_L];
+                build_spread_table(chunk_si, spread_local);
+                build_decode_table(chunk_si, spread_local, dec_data + (size_t)lc * ANS_L);
+            });
 
             uint32_t local_out_offset = lc_start * CHUNK_SIZE;
             uint32_t batch_bytes = (uint32_t)std::min(
@@ -813,7 +893,7 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                 [enc setComputePipelineState:pso_lz77];
                 [enc setBuffer:slot_tok[sl]  offset:0 atIndex:0];
                 [enc setBuffer:slot_tcnt[sl] offset:0 atIndex:1];
-                [enc setBuffer:buf_out       offset:(size_t)local_out_offset atIndex:2];
+                [enc setBuffer:mb_out[mb_out_slot] offset:(size_t)local_out_offset atIndex:2];
                 [enc setBuffer:slot_lzerr[sl] offset:0 atIndex:3];
                 [enc setBytes:&batch_bytes   length:4 atIndex:4];
                 [enc dispatchThreadgroups:MTLSizeMake(lc_count, 1, 1)
@@ -835,6 +915,8 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                 const uint32_t* ans_err = (const uint32_t*)cap_anserr.contents;
                 const uint32_t* lz_err = (const uint32_t*)cap_lzerr.contents;
                 for (uint32_t i = 0; i < lc_count; i++) {
+                    DLOG("    GPU result chunk %u: ans_err=%u lz_err=%u",
+                         gc_start + i, ans_err[i], lz_err[i]);
                     if (ans_err[i] != 0u) {
                         fprintf(stderr, "[APLZ] Invalid ANS stream at chunk %u.\n", gc_start + i);
                         decode_failed = true;
@@ -858,7 +940,9 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
 
         dispatch_group_wait(done_grp, DISPATCH_TIME_FOREVER);
         if (decode_failed) {
-            fclose(f);
+            dispatch_semaphore_signal(out_sem);
+            munmap(mapped, in_size);
+            close(fd);
             fclose(fout);
             unlink(out_path);
             return EXIT_FAILURE;
@@ -867,13 +951,29 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
         size_t mb_bytes = std::min(
             (size_t)mc_count * CHUNK_SIZE,
             (size_t)(original_size - (uint64_t)mc_start * CHUNK_SIZE));
-        if (fwrite(buf_out.contents, 1, mb_bytes, fout) != mb_bytes) {
-            perror("[APLZ] fwrite output");
-            fclose(f); fclose(fout); unlink(out_path); return EXIT_FAILURE;
-        }
+        id<MTLBuffer> cap_out = mb_out[mb_out_slot];
+        dispatch_group_enter(write_grp);
+        dispatch_async(write_q, ^{
+            if (!write_failed && fwrite(cap_out.contents, 1, mb_bytes, fout) != mb_bytes) {
+                perror("[APLZ] fwrite output");
+                write_failed = true;
+            }
+            dispatch_semaphore_signal(out_sem);
+            dispatch_group_leave(write_grp);
+        });
     }
 
-    fclose(f);
+    dispatch_group_wait(write_grp, DISPATCH_TIME_FOREVER);
+    if (write_failed) {
+        munmap(mapped, in_size);
+        close(fd);
+        fclose(fout);
+        unlink(out_path);
+        return EXIT_FAILURE;
+    }
+
+    munmap(mapped, in_size);
+    close(fd);
     fclose(fout);
 
     CFTimeInterval t_total_end = CACurrentMediaTime();
@@ -890,10 +990,15 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
 int main(int argc, const char* argv[]) {
     @autoreleasepool {
 
+    // --debug フラグを全引数からスキャン
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug") == 0) { g_debug = true; break; }
+    }
+
     if (argc < 5) {
         fprintf(stderr, "Usage:\n");
-        fprintf(stderr, "  %s -c <input> <output.aplz> <compression.metal>\n", argv[0]);
-        fprintf(stderr, "  %s -d <input.aplz> <output> <compression.metal>\n", argv[0]);
+        fprintf(stderr, "  %s -c <input> <output.aplz> <compression.metal> [--debug]\n", argv[0]);
+        fprintf(stderr, "  %s -d <input.aplz> <output> <compression.metal> [--debug]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -901,6 +1006,8 @@ int main(int argc, const char* argv[]) {
     const char* path1 = argv[2];
     const char* path2 = argv[3];
     const char* shader = argv[4];
+
+    if (g_debug) fprintf(stderr, "[APLZ DBG] debug mode enabled\n");
 
     if (strcmp(mode, "-c") == 0) {
         return compress(path1, path2, shader);
