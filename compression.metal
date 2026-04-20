@@ -113,6 +113,20 @@ kernel void compress_chunk(
             }
             if (best != 0xFFFFFFFFu) {
                 uint maxl = min(MAX_MATCH, clen - i), mlen = 0u;
+                // Fast 4-byte comparison loop
+                while (mlen + 4u <= maxl) {
+                    uint4 a = uint4(
+                        in_data[base+best+mlen], in_data[base+best+mlen+1u],
+                        in_data[base+best+mlen+2u], in_data[base+best+mlen+3u]
+                    );
+                    uint4 b = uint4(
+                        in_data[base+i+mlen], in_data[base+i+mlen+1u],
+                        in_data[base+i+mlen+2u], in_data[base+i+mlen+3u]
+                    );
+                    if (a.x != b.x || a.y != b.y || a.z != b.z || a.w != b.w) break;
+                    mlen += 4u;
+                }
+                // Handle remaining bytes
                 while (mlen < maxl &&
                        in_data[base+best+mlen] == in_data[base+i+mlen]) ++mlen;
                 if (mlen >= MIN_MATCH) {
