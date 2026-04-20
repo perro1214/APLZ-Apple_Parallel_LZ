@@ -29,7 +29,7 @@
 #include "APLZ.h"
 
 // ─── デバッグフラグ ────────────────────────────────────────────────────────────
-static bool g_debug = false;
+static bool g_debug = true;
 #define DLOG(fmt, ...) \
     do { if (g_debug) fprintf(stderr, "[APLZ DBG] " fmt "\n", ##__VA_ARGS__); } while(0)
 
@@ -421,7 +421,10 @@ static int compress(const char* in_path, const char* out_path, const char* shade
         uint32_t sl_mb = mb % N_BUFS;
 
         // Pass1 完了を待機してから CPU でバッファを参照
+        CFTimeInterval t_pass1_wait = CACurrentMediaTime();
         dispatch_semaphore_wait(pass1_sem[sl_mb], DISPATCH_TIME_FOREVER);
+        CFTimeInterval t_pass1_done = CACurrentMediaTime();
+        DLOG("[timing] mega-batch %u Pass1 GPU wait: %.3f ms", mb, (t_pass1_done - t_pass1_wait) * 1000.0);
         uint32_t mb_prefetch = mb + N_BUFS;
         if (mb_prefetch < n_mega) {
             uint32_t sl_pf = mb_prefetch % N_BUFS;
@@ -443,22 +446,25 @@ static int compress(const char* in_path, const char* out_path, const char* shade
         // buf_cnt のローカルコピー
         std::vector<uint32_t> mb_cnt(cnt_ptr, cnt_ptr + mc_count);
 
+        CFTimeInterval t_table_start = CACurrentMediaTime();
         // ── Per-chunk テーブル構築 + Pass2 バッチパイプライン ─────────────
         // per-chunk の SymInfo を構築して配列に格納
         // 全メガバッチ分の SymInfo を保持 (ファイル書き出しに必要)
         std::vector<SymInfo> mb_sym_infos(mc_count * N_SYMBOLS);
 
+        CFTimeInterval t_hist_start = CACurrentMediaTime();
         for (uint32_t c = 0; c < mc_count; c++) {
             SymInfo* si = &mb_sym_infos[c * N_SYMBOLS];
             uint32_t raw_freq[N_SYMBOLS];
             uint32_t chunk_matches = compute_chunk_histogram(
                 compact_ptr + (uint64_t)c * CHUNK_SIZE, cnt_ptr[c], raw_freq);
             total_matches += chunk_matches;
-            DLOG("  chunk %u: tokens=%u matches=%u (%.1f%%)",
-                 mc_start + c, cnt_ptr[c], chunk_matches,
-                 cnt_ptr[c] ? 100.0 * chunk_matches / cnt_ptr[c] : 0.0);
             normalize_histogram(raw_freq, si);
         }
+        CFTimeInterval t_hist_done = CACurrentMediaTime();
+        DLOG("[timing] mega-batch %u CPU histogram: %.3f ms (%.1f ms/chunk)",
+             mb, (t_hist_done - t_hist_start) * 1000.0,
+             (t_hist_done - t_hist_start) * 1000.0 / mc_count);
 
         // Pass2 ダブルバッファ バッチループ
         uint32_t mb_n_batches = (mc_count + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
@@ -509,8 +515,16 @@ static int compress(const char* in_path, const char* out_path, const char* shade
                 mb_sym_infos.begin() + lc_start * N_SYMBOLS,
                 mb_sym_infos.begin() + (lc_start + lc_count) * N_SYMBOLS);
 
+            CFTimeInterval t_pass2_dispatch = CACurrentMediaTime();
+            DLOG("[timing] batch %u Pass2 GPU dispatch: %.3f ms", b, (t_pass2_dispatch - t_table_start) * 1000.0);
+
+            uint32_t batch_id = b;
+            CFTimeInterval t_pass2_dispatch_copy = t_pass2_dispatch;
+
             dispatch_group_enter(done_grp);
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
+                CFTimeInterval t_pass2_done = CACurrentMediaTime();
+                DLOG("[timing] batch %u Pass2 GPU complete: %.3f ms", batch_id, (t_pass2_done - t_pass2_dispatch_copy) * 1000.0);
                 dispatch_async(write_q, ^{
                     const uint8_t*  bs  = (const uint8_t*)cap_bs.contents;
                     const uint32_t* bsz = (const uint32_t*)cap_bsz.contents;
@@ -551,7 +565,11 @@ static int compress(const char* in_path, const char* out_path, const char* shade
                             }
                         }
                         chunk_blob.insert(chunk_blob.end(), payload.begin(), payload.end());
+                        CFTimeInterval t_write_start = CACurrentMediaTime();
                         fwrite(chunk_blob.data(), 1, chunk_blob.size(), fout);
+                        CFTimeInterval t_write_done = CACurrentMediaTime();
+                        DLOG("[timing] chunk %u file write: %.3f ms (%zu bytes)",
+                             gc, (t_write_done - t_write_start) * 1000.0, chunk_blob.size());
                     }
 
                     dispatch_semaphore_signal(buf_sem);
