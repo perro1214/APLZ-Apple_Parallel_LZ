@@ -1,0 +1,8 @@
+# Compiled binaries & Metal shader intermediates in aplz_x
+phase1_rans/bench_rans32
+phase2_hetero/bench_phase2
+phase3_asz/asz
+phase3_asz/test_phase3
+*.air
+*.metallib
+.DS_Store
