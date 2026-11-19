@@ -43,9 +43,10 @@ static const uint8_t  ASZ_CLASS_BINARY      = 4u; // その他一般バイナリ
 static const uint8_t  ASZ_NUM_CLASSES       = 5u;
 
 // チャンク / パック設計定数
-static const uint32_t ASZ_SMALL_FILE_THRESH = 65536u;             // < 64 KiB は型別 Solid Grouping
-static const uint32_t ASZ_SOLID_PACK_MAX    = 4u * 1024u * 1024u; // Solid Pack 上限 4 MiB
-static const uint32_t ASZ_LARGE_PACK_MAX    = 64u * 1024u * 1024u;// 大ファイル Pack 上限 64 MiB (内部 256 KiB 独立シーク)
+static const uint32_t ASZ_SMALL_FILE_THRESH = 65536u;               // < 64 KiB は型別 Solid Grouping
+static const uint32_t ASZ_SOLID_PACK_MAX    = 4u * 1024u * 1024u;   // Solid Pack 上限 4 MiB
+static const uint32_t ASZ_LARGE_PACK_MAX    = 128u * 1024u * 1024u; // 大ファイル FastCDC Pack 上限 128 MiB (内部 256 KiB 独立シーク)
+static const uint32_t ASZ_STREAM_PACK_MAX   = 256u * 1024u * 1024u; // 非重複排除ダイレクトストリーム Pack 上限 256 MiB
 
 // ─── バイナリ構造体 (1 バイトアライン固定) ──────────────────────────────────────
 #pragma pack(push, 1)

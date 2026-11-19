@@ -570,12 +570,18 @@ static inline bool rans32_decode_tile_scalar(
     return true;
 }
 
-// ─── 5. ARM64 NEON 32-way レジスタ常駐・ブランチレス高速デコーダ ──────────────
+static inline uint16_t rans32_load_u16_ua(const uint8_t* p) {
+    uint16_t v;
+    memcpy(&v, p, 2u);
+    return v;
+}
+
+// ─── 5. ARM64 NEON 32-way レジスタ常駐・ブランチレス高速デコーダ (ゼロコピー非アライン対応) ─
 // Apple Silicon の 32 本の 128-bit NEON レジスタを活かし、
 // 32 レーンの rANS 状態を 8 本の uint32x4_t (v0..v7) に常駐させてスタックスピルを排除。
-// 8 グループ並列の独立ポインタ + 完全ブランチレス補充で 32 B/step 展開する。
-static inline bool rans32_decode_tile_neon(
-    const uint16_t* __restrict words,
+// 8 グループ並列の独立バイトポインタ + 完全ブランチレス補充で奇数アドレスもコピーゼロ展開!
+static inline bool rans32_decode_tile_neon_bytes(
+    const uint8_t*  __restrict words_bytes,
     uint32_t                   word_count,
     const uint32_t* __restrict final_states,
     const uint32_t* __restrict dec_lut,
@@ -583,7 +589,9 @@ static inline bool rans32_decode_tile_neon(
     uint32_t                   tile_len
 ) {
 #if !defined(__aarch64__)
-    return rans32_decode_tile_scalar(words, word_count, final_states, dec_lut, out_tile, tile_len);
+    std::vector<uint16_t> wtmp(word_count);
+    if (word_count > 0u) memcpy(wtmp.data(), words_bytes, (size_t)word_count * 2u);
+    return rans32_decode_tile_scalar(wtmp.data(), word_count, final_states, dec_lut, out_tile, tile_len);
 #else
     const uint32x4_t v_rans_l = vdupq_n_u32(RANS32_L);
     const uint32x4_t v_mask12 = vdupq_n_u32(RANS32_PROB_MASK);
@@ -628,37 +636,37 @@ static inline bool rans32_decode_tile_neon(
         do {                                                                    \
             uint32_t _s0 = vgetq_lane_u32(ST, 0);                               \
             uint32_t _n0 = (_s0 < RANS32_L);                                    \
-            uint32_t _w0 = *(P);                                                \
+            uint32_t _w0 = rans32_load_u16_ua(P);                               \
             _s0 = _n0 ? ((_s0 << 16u) | _w0) : _s0;                             \
-            (P) += _n0;                                                         \
+            (P) += (_n0 << 1u);                                                 \
             uint32_t _s1 = vgetq_lane_u32(ST, 1);                               \
             uint32_t _n1 = (_s1 < RANS32_L);                                    \
-            uint32_t _w1 = *(P);                                                \
+            uint32_t _w1 = rans32_load_u16_ua(P);                               \
             _s1 = _n1 ? ((_s1 << 16u) | _w1) : _s1;                             \
-            (P) += _n1;                                                         \
+            (P) += (_n1 << 1u);                                                 \
             uint32_t _s2 = vgetq_lane_u32(ST, 2);                               \
             uint32_t _n2 = (_s2 < RANS32_L);                                    \
-            uint32_t _w2 = *(P);                                                \
+            uint32_t _w2 = rans32_load_u16_ua(P);                               \
             _s2 = _n2 ? ((_s2 << 16u) | _w2) : _s2;                             \
-            (P) += _n2;                                                         \
+            (P) += (_n2 << 1u);                                                 \
             uint32_t _s3 = vgetq_lane_u32(ST, 3);                               \
             uint32_t _n3 = (_s3 < RANS32_L);                                    \
-            uint32_t _w3 = *(P);                                                \
+            uint32_t _w3 = rans32_load_u16_ua(P);                               \
             _s3 = _n3 ? ((_s3 << 16u) | _w3) : _s3;                             \
-            (P) += _n3;                                                         \
+            (P) += (_n3 << 1u);                                                 \
             ST = (uint32x4_t){_s0, _s1, _s2, _s3};                              \
         } while (0)
 
     #define RANS32_SAFE_REFILL4(ST, P)                                          \
         do {                                                                    \
             uint32_t _s0 = vgetq_lane_u32(ST, 0);                               \
-            if (_s0 < RANS32_L) _s0 = (_s0 << 16u) | (uint32_t)(*(P)++);        \
+            if (_s0 < RANS32_L) { _s0 = (_s0 << 16u) | rans32_load_u16_ua(P); (P) += 2u; } \
             uint32_t _s1 = vgetq_lane_u32(ST, 1);                               \
-            if (_s1 < RANS32_L) _s1 = (_s1 << 16u) | (uint32_t)(*(P)++);        \
+            if (_s1 < RANS32_L) { _s1 = (_s1 << 16u) | rans32_load_u16_ua(P); (P) += 2u; } \
             uint32_t _s2 = vgetq_lane_u32(ST, 2);                               \
-            if (_s2 < RANS32_L) _s2 = (_s2 << 16u) | (uint32_t)(*(P)++);        \
+            if (_s2 < RANS32_L) { _s2 = (_s2 << 16u) | rans32_load_u16_ua(P); (P) += 2u; } \
             uint32_t _s3 = vgetq_lane_u32(ST, 3);                               \
-            if (_s3 < RANS32_L) _s3 = (_s3 << 16u) | (uint32_t)(*(P)++);        \
+            if (_s3 < RANS32_L) { _s3 = (_s3 << 16u) | rans32_load_u16_ua(P); (P) += 2u; } \
             ST = (uint32x4_t){_s0, _s1, _s2, _s3};                              \
         } while (0)
 
@@ -690,11 +698,11 @@ static inline bool rans32_decode_tile_neon(
         rp -= cnt;
         if (__builtin_expect(cnt == 0u, 0)) continue;
 
-        const uint16_t* base_p = words + rp;
-        const uint16_t* p0 = base_p;      const uint16_t* p1 = base_p + o1;
-        const uint16_t* p2 = base_p + o2; const uint16_t* p3 = base_p + o3;
-        const uint16_t* p4 = base_p + o4; const uint16_t* p5 = base_p + o5;
-        const uint16_t* p6 = base_p + o6; const uint16_t* p7 = base_p + o7;
+        const uint8_t* base_p = words_bytes + ((size_t)rp << 1u);
+        const uint8_t* p0 = base_p;               const uint8_t* p1 = base_p + (o1 << 1u);
+        const uint8_t* p2 = base_p + (o2 << 1u);  const uint8_t* p3 = base_p + (o3 << 1u);
+        const uint8_t* p4 = base_p + (o4 << 1u);  const uint8_t* p5 = base_p + (o5 << 1u);
+        const uint8_t* p6 = base_p + (o6 << 1u);  const uint8_t* p7 = base_p + (o7 << 1u);
 
         if (__builtin_expect(rp + 32u <= word_count, 1)) {
             RANS32_BRANCHLESS_REFILL4(st0, p0);
@@ -744,9 +752,12 @@ static inline bool rans32_decode_tile_neon(
         uint32_t cnt = (uint32_t)__builtin_popcount(mask);
         if (rp < cnt) return false;
         rp -= cnt;
-        const uint16_t* wp = words + rp;
+        const uint8_t* wp = words_bytes + ((size_t)rp << 1u);
         for (uint32_t l = 0; l < rem; ++l) {
-            if (mask & (1u << l)) st[l] = (st[l] << 16u) | (uint32_t)(*wp++);
+            if (mask & (1u << l)) {
+                st[l] = (st[l] << 16u) | (uint32_t)rans32_load_u16_ua(wp);
+                wp += 2u;
+            }
         }
     }
 
@@ -756,4 +767,15 @@ static inline bool rans32_decode_tile_neon(
     }
     return true;
 #endif
+}
+
+static inline bool rans32_decode_tile_neon(
+    const uint16_t* __restrict words,
+    uint32_t                   word_count,
+    const uint32_t* __restrict final_states,
+    const uint32_t* __restrict dec_lut,
+    uint8_t*        __restrict out_tile,
+    uint32_t                   tile_len
+) {
+    return rans32_decode_tile_neon_bytes((const uint8_t*)words, word_count, final_states, dec_lut, out_tile, tile_len);
 }
