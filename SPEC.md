@@ -1,12 +1,12 @@
-# APLZ-X (`.asz`) 詳細設計仕様書 — Apple Silicon UMA 異種協調圧縮エンジン
+# APLZ v4 (`.aplz`) 詳細設計仕様書 — Apple Silicon UMA 異種協調圧縮エンジン
 
-> Status: Phase 1〜3 実装・実測検証・実用化仕上げ完了（既存 APLZ v3 との後方互換なし）
+> Status: APLZ v4 実装・実測検証・実用化完了（旧 APLZ v3 との後方互換なし）
 
 ---
 
 ## 1. 設計思想と全体アーキテクチャ
 
-APLZ-X は Apple Silicon（M1〜M4+）のハードウェア構造から逆算して設計された次世代ロスレス圧縮・解凍エンジンおよびネイティブアーカイバ（`.asz`）である。
+APLZ v4 は Apple Silicon（M1〜M4+）のハードウェア構造から逆算して設計された次世代ロスレス圧縮・解凍エンジンおよびネイティブアーカイバ（`.aplz`）である。
 
 ### 1.1 中核原則
 1. **UMA（Unified Memory Architecture）真・異種協調**:
@@ -30,7 +30,7 @@ APLZ-X は Apple Silicon（M1〜M4+）のハードウェア構造から逆算し
 |---|---|---|
 | **Phase 1** (`src/rans/`) | **32-way Coalesced rANS コア**（Metal GPU + ARM64 NEON + Scalar + 4-way ILP ブランチレス CPU Enc、256 KiB ブロック / 64 KiB タイル、テーブル共有、RAW/RLE フォールバック、破損検知） | **完了** — GPU Enc ↔ CPU Scalar / NEON / Fast Enc ↔ GPU Dec 全クロス 100% ビット完全一致・破損入力 100% 検知 |
 | **Phase 2** (`src/engine/`) | **UMA 異種パイプラインエンジン (`ASZ2`)**（3 スロット非同期 `CPU \|\| GPU \|\| Pack+fwrite`、Zero-Cold-Start Hybrid、NEON Byte-Shuffle / ARM64 BCJ、エポック ハッシュ分離ストリーム LZ、2 スロット非同期 GPU デコード、256 KiB ランダムアクセス `decompress_range`） | **完了** — 252 ラウンドトリップ + 1-bit 破損検知 + 18 GPU==CPU パリティ全 PASS（警告 0） |
-| **Phase 3** (`src/asz/`) | **`.asz` ネイティブコンテナ & `asz` CLI**（一時 `.tar` 廃止、5 クラス型別 Solid Grouping、並列正規化 FastCDC 重複排除、O(1) 一覧表示、256 KiB ブロック単位部分展開、3 重 CRC32C 検査、Zip-Slip / symlink 逸脱完全防御、`install.sh` / `setup_finder.sh`） | **完了** — 自動テスト 8/8 PASS（警告 0）、979 ファイル実ディレクトリ・256 MiB・1.00 GiB ストリーミング検証完了 |
+| **Phase 3** (`src/archive/`) | **`.aplz` v4 ネイティブコンテナ & `aplz` CLI**（一時 `.tar` 廃止、5 クラス型別 Solid Grouping、並列正規化 FastCDC 重複排除、O(1) 一覧表示、256 KiB ブロック単位部分展開、3 重 CRC32C 検査、Zip-Slip / symlink 逸脱完全防御、`install.sh` / `setup_finder.sh`） | **完了** — 自動テスト 9/9 PASS（警告 0）、979 ファイル実ディレクトリ・256 MiB・1.00 GiB ストリーミング検証完了 |
 
 ---
 
@@ -265,9 +265,9 @@ Slot N   (Write Queue):[厳密順序保証・適応並列ゼロ中間コピー�
 
 ---
 
-## 4. Phase 3 詳細仕様: `.asz` ネイティブコンテナ & アーカイバ
+## 4. Phase 3 詳細仕様: `.aplz` v4 ネイティブコンテナ & アーカイバ
 
-Phase 3（`src/asz/`）は、一時 `.tar` ファイルを完全に廃止し、ディレクトリツリー・シンボリックリンク・POSIX 権限・更新時刻を単一 `.asz` コンテナへ直接格納するネイティブアーカイバおよび `asz` CLI である。
+Phase 3（`src/archive/`）は、一時 `.tar` ファイルを完全に廃止し、ディレクトリツリー・シンボリックリンク・POSIX 権限・更新時刻を単一 `.aplz` コンテナへ直接格納するネイティブアーカイバおよび `aplz` CLI である。
 
 ### 4.1 格納戦略: 型別 Solid Grouping + 並列正規化 FastCDC
 
@@ -293,12 +293,12 @@ Phase 3（`src/asz/`）は、一時 `.tar` ファイルを完全に廃止し、�
 - **マルチコア並列化**: `>= 8 MiB` の大ファイルは 8 MiB スーパースライス単位で全 CPU コア並列チャンク分割を実行する。
 - **160-bit 強コンテンツ指紋**: 1 パス 32 B ロードで `wyhash128`（`hash_lo`, `hash_hi`）と ARM64 ハードウェア `__crc32cd`（`crc32c`）を同時計算し、`(hash_lo, hash_hi, raw_size, crc32c)` で重複判定する。
 
-### 4.2 `.asz` v1 バイナリコンテナフォーマット
+### 4.2 `.aplz` v4 バイナリコンテナフォーマット
 
 ```text
 [AszFileHeader: 40 B] (オフセット 0 固定)
-  uint8_t  magic[4]             = { 'A', 'S', 'Z', 0x01 }
-  uint32_t version              = 1
+  uint8_t  magic[4]             = { 'A', 'P', 'L', 'Z' }  // 旧 v3 (version=3) とは version=4 で明確分離
+  uint32_t version              = 4
   uint32_t flags                // bit0: ASZ_FLAG_DEDUP, bit1: ASZ_FLAG_SOLID
   uint32_t level                // 1 / 3 / 6
   uint64_t directory_offset     // セントラルディレクトリ開始位置
@@ -364,12 +364,12 @@ Phase 3（`src/asz/`）は、一時 `.tar` ファイルを完全に廃止し、�
 
 ### 4.3 高速読み取り・部分展開・整合性・セキュリティ仕様
 
-1. **O(1) 一覧表示 (`asz l`)**: `AszFileHeader` (40 B) と末尾の `Central Directory` のみを読んで表示するため、GB 級アーカイブでも数ミリ秒で完了する。
-2. **256 KiB ブロック単位 O(1) 部分展開 (`asz x archive.asz -C out <path>`)**:
+1. **O(1) 一覧表示 (`aplz l`)**: `AszFileHeader` (40 B) と末尾の `Central Directory` のみを読んで表示するため、GB 級アーカイブでも数ミリ秒で完了する。
+2. **256 KiB ブロック単位 O(1) 部分展開 (`aplz x archive.aplz -C out <path>`)**:
    - 指定ファイルが参照する Extent の `(pack_id, offset_in_pack, length)` のみを抽出し、`HeteroEngine::decompress_range` で該当 256 KiB ブロックだけを選択復号する（例: 64 MiB パック内の 128 KiB ファイルなら 1 ブロック = 256 KiB のみ復号、0.3 ms 未満）。
 3. **パック順序最適化 & 2 スロット LRU キャッシュ**:
    - 全展開 (`extract`) および検証 (`verify`) では、対象ファイルを `(first_pack_id, offset_in_pack)` 順にソートしてから展開するため、マルチクラスアーカイブでも各パックの復号回数は厳密に 1 回で済む。
-4. **3 重破損検知 (`asz t` / 展開時自動検証)**:
+4. **3 重破損検知 (`aplz t` / 展開時自動検証)**:
    - Layer 1: `AszFileHeader.header_crc32c` + `Central Directory` の `ASZ2` ブロック CRC32C
    - Layer 2: 各パックの `AszPackDesc.pack_crc32c`（圧縮ストリーム全体の破損検知）+ `HxBlockHeader.crc32c` + rANS 32 レーン終端状態厳密検証
    - Layer 3: 各ファイルの `AszEntryDesc.file_crc32c`（全展開・部分展開双方で検証）
@@ -387,22 +387,22 @@ Phase 3（`src/asz/`）は、一時 `.tar` ファイルを完全に廃止し、�
 
 | ツール | 圧縮後サイズ (圧縮率) | 圧縮速度 (時間) | 解凍速度 (時間) | 整合性検査 (`t`) | 一覧 (`l`) |
 |---|---:|---:|---:|---:|---:|
-| **`asz -3` (default)** | **384.8 MiB (37.58%)** | **2,949 MB/s (0.35 s)** | **2,398 MB/s (0.43 s)** | 0.39 s | 7.1 ms |
-| `asz -1` (fast) | 392.0 MiB (38.28%) | 793 MB/s (初回コールド) | 2,000 MB/s (0.51 s) | 0.57 s | 8.4 ms |
+| **`aplz -3` (default)** | **384.8 MiB (37.58%)** | **2,949 MB/s (0.35 s)** | **2,398 MB/s (0.43 s)** | 0.39 s | 7.1 ms |
+| `aplz -1` (fast) | 392.0 MiB (38.28%) | 793 MB/s (初回コールド) | 2,000 MB/s (0.51 s) | 0.57 s | 8.4 ms |
 | `zstd -3 -T0` | 677.8 MiB (66.19%) | 2,248 MB/s (0.46 s) | 1,183 MB/s (0.87 s) | — | — |
 
 ### 5.2 979 ファイル実ディレクトリ（`ml_project`, 90.6 MiB、エンドツーエンド CLI）
 
 | ツール | アーカイブサイズ (比率) | 作成 (Pack) | 全展開 (Full) | 一覧 (List) | 1 ファイル部分展開 |
 |---|---:|---:|---:|---:|---:|
-| **`asz -3`** | **24.60 MB (25.9%)** | **81.8 ms** | **217.7 ms** | **4.1 ms** | **8.94 ms** |
-| **`asz -1`** | **25.27 MB (26.6%)** | **76.9 ms** | 262.4 ms | **4.2 ms** | **4.73 ms** |
+| **`aplz -3`** | **24.60 MB (25.9%)** | **81.8 ms** | **217.7 ms** | **4.1 ms** | **8.94 ms** |
+| **`aplz -1`** | **25.27 MB (26.6%)** | **76.9 ms** | 262.4 ms | **4.2 ms** | **4.73 ms** |
 | `tar + zstd -3 -T0` | 50.40 MB (53.1%) | 399.6 ms | 467.2 ms | 70.2 ms | 80.58 ms |
 | `tar + lz4 -1` | 69.78 MB (73.5%) | 426.3 ms | 407.5 ms | 49.7 ms | 49.46 ms |
 
 ### 5.3 Phase 2 コア（64 MiB インメモリ、定常スループット）
 
-| データセット (64 MiB) | `asz` L1 圧縮率 / 圧縮 / 解凍 | `asz` L3 圧縮率 / 圧縮 / 解凍 | `asz` L6 圧縮率 / 圧縮 / 解凍 |
+| データセット (64 MiB) | `aplz` L1 圧縮率 / 圧縮 / 解凍 | `aplz` L3 圧縮率 / 圧縮 / 解凍 | `aplz` L6 圧縮率 / 圧縮 / 解凍 |
 |---|---:|---:|---:|
 | `Source+Docs` | 28.6% / 2,746 / 3,354 MB/s | 26.3% / 1,537 / 3,410 MB/s | 24.5% / 1,072 / 4,050 MB/s |
 | `Mach-O ARM64` | 43.8% / 2,280 / 3,356 MB/s | 41.4% / 1,167 / 3,570 MB/s | 40.0% / 729 / 3,006 MB/s |

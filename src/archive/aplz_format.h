@@ -1,10 +1,10 @@
-// asz_format.h — APLZ-X Phase 3: `.asz` ネイティブコンテナ形式・型分類・セキュリティ検証
+// aplz_format.h — APLZ v4: `.aplz` ネイティブコンテナ形式・型分類・セキュリティ検証
 //
 // アーカイブレイアウト:
-//   [AszFileHeader: 40 B] (magic="ASZ\x01", directory_offset, directory_comp_size, header_crc32c)
+//   [AszFileHeader: 40 B] (magic="APLZ", version=4, directory_offset, directory_comp_size, header_crc32c)
 //   [Data Packs: Phase 2 ASZ2 圧縮パック列]
 //     - 小ファイル (< 64 KiB): 型別 Solid Grouping (TEXT / CODE / NUMERIC / MEDIA / BINARY, 上限 4 MiB/Pack)
-//     - 大ファイル (>= 64 KiB): FastCDC 重複排除済みユニークチャンク列 (上限 32 MiB/Pack)
+//     - 大ファイル (>= 64 KiB): FastCDC 重複排除済みユニークチャンク列 (上限 64 MiB/Pack)
 //   [Compressed Central Directory: Phase 2 ASZ2 圧縮済みメタデータ]
 //     - AszDirHeader
 //     - AszPackDesc[num_packs]
@@ -24,8 +24,8 @@
 #include "../engine/hetero_format.h"
 
 // ─── 定数・フラグ ──────────────────────────────────────────────────────────────
-static const uint8_t  ASZ_MAGIC[4]          = { 'A', 'S', 'Z', 0x01 };
-static const uint32_t ASZ_VERSION           = 1u;
+static const uint8_t  ASZ_MAGIC[4]          = { 'A', 'P', 'L', 'Z' };
+static const uint32_t ASZ_VERSION           = 4u;
 
 static const uint32_t ASZ_FLAG_DEDUP        = 1u << 0u;
 static const uint32_t ASZ_FLAG_SOLID        = 1u << 1u;

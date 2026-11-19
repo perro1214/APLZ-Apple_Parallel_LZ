@@ -1,8 +1,10 @@
 # Build artifacts
 build/
+aplz
 asz
 bench_rans32
 bench_phase2
+test_archive
 test_phase3
 gpu_zip
 *.o
@@ -10,9 +12,9 @@ gpu_zip
 *.metallib
 
 # Archives & test data
+*.aplz
 *.asz
 *.asz2
-*.aplz
 *.bin
 decoded*
 

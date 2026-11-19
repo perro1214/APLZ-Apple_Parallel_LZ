@@ -29,8 +29,8 @@
 #include <algorithm>
 #include <functional>
 
-#include "asz_format.h"
-#include "asz_fastcdc.h"
+#include "aplz_format.h"
+#include "aplz_fastcdc.h"
 #include "../engine/hetero_engine.h"
 
 struct AszCreateOptions {
@@ -734,8 +734,12 @@ public:
     bool parse_directory_from_mem(const uint8_t* data, size_t size, AszParsedDir& out) {
         if (size < sizeof(AszFileHeader)) { last_error = "Archive too small"; return false; }
         memcpy(&out.fhdr, data, sizeof(AszFileHeader));
-        if (memcmp(out.fhdr.magic, ASZ_MAGIC, 4) != 0 || out.fhdr.version != ASZ_VERSION) {
-            last_error = "Invalid .asz magic or unsupported version";
+        if (memcmp(out.fhdr.magic, ASZ_MAGIC, 4) != 0) {
+            last_error = "Invalid .aplz magic";
+            return false;
+        }
+        if (out.fhdr.version != ASZ_VERSION) {
+            last_error = "Unsupported .aplz version " + std::to_string(out.fhdr.version) + " (requires APLZ v4)";
             return false;
         }
         uint32_t exp_hcrc = hx_crc32c((const uint8_t*)&out.fhdr, offsetof(AszFileHeader, header_crc32c));

@@ -1,11 +1,11 @@
-// asz_main.mm — APLZ-X Phase 3: `.asz` ネイティブ圧縮・アーカイブ CLI (`asz`)
+// aplz_main.mm — APLZ v4: `.aplz` ネイティブ圧縮・アーカイブ CLI (`aplz`)
 //
 // 使い方:
-//   asz c [-1|-3|-6] [--no-dedup] [--no-solid] [-q] [-o <out.asz>] <input1> [input2 ...]
-//   asz x <archive.asz> [-C <out_dir>] [-q] [path_filter ...]
-//   asz d <archive.asz> <out_file> [-q]
-//   asz l <archive.asz>
-//   asz t <archive.asz>
+//   aplz c [-1|-3|-6] [--no-dedup] [--no-solid] [-q] [-o <out.aplz>] <input1> [input2 ...]
+//   aplz x <archive.aplz> [-C <out_dir>] [-q] [path_filter ...]
+//   aplz d <archive.aplz> <out_file> [-q]
+//   aplz l <archive.aplz>
+//   aplz t <archive.aplz>
 #import <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
 #include <stdio.h>
@@ -16,12 +16,12 @@
 #include <string>
 #include <vector>
 
-#include "asz_archiver.h"
+#include "aplz_archiver.h"
 
-static const char* ASZ_CLI_VERSION = "0.3.0 (APLZ-X Phase 3, ASZ v1)";
+static const char* APLZ_CLI_VERSION = "4.0.0 (APLZ v4 — Apple Silicon UMA Archiver)";
 
 static std::string find_shader_dir() {
-    if (const char* env = getenv("ASZ_SHADER_DIR")) {
+    if (const char* env = getenv("APLZ_SHADER_DIR")) {
         if (env[0] != '\0') return std::string(env);
     }
     char exe_buf[4096];
@@ -36,12 +36,12 @@ static std::string find_shader_dir() {
             stat((dir + "/hetero_kernels.metal").c_str(), &st) == 0) {
             return dir;
         }
-        // 2) 標準インストール先 (<prefix>/bin/asz → <prefix>/share/asz/)
-        std::string share = dir + "/../share/asz";
+        // 2) 標準インストール先 (<prefix>/bin/aplz → <prefix>/share/aplz/)
+        std::string share = dir + "/../share/aplz";
         if (stat((share + "/hetero_kernels.metallib").c_str(), &st) == 0) {
             return share;
         }
-        // 3) 開発ツリー (<repo>/build/asz → ../src/engine/ または <repo>/asz → src/engine/)
+        // 3) 開発ツリー (<repo>/build/aplz → ../src/engine/ または <repo>/aplz → src/engine/)
         std::string dev1 = dir + "/../src/engine";
         if (stat((dev1 + "/hetero_kernels.metallib").c_str(), &st) == 0 ||
             stat((dev1 + "/hetero_kernels.metal").c_str(), &st) == 0) {
@@ -67,17 +67,17 @@ static std::string fmt_bytes(uint64_t b) {
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
-        "APLZ-X (.asz) — Apple Silicon UMA Heterogeneous Archiver (Phase 3)\n\n"
+        "APLZ v4 (.aplz) — Apple Silicon UMA Heterogeneous Archiver\n\n"
         "Usage:\n"
-        "  %s c [-1|-3|-6] [--no-dedup] [--no-solid] [-q] [-o <out.asz>] <input> [input2 ...]\n"
-        "      Create .asz archive from file(s) and/or directory(ies)\n\n"
-        "  %s x <archive.asz> [-C <out_dir>] [-q] [filter_path ...]\n"
+        "  %s c [-1|-3|-6] [--no-dedup] [--no-solid] [-q] [-o <out.aplz>] <input> [input2 ...]\n"
+        "      Create .aplz archive from file(s) and/or directory(ies)\n\n"
+        "  %s x <archive.aplz> [-C <out_dir>] [-q] [filter_path ...]\n"
         "      Extract full archive or specific file(s)/folder(s) (O(1) block random access)\n\n"
-        "  %s d <archive.asz> <out_file> [-q]\n"
-        "      Decompress single-file .asz directly to <out_file>\n\n"
-        "  %s l <archive.asz>\n"
+        "  %s d <archive.aplz> <out_file> [-q]\n"
+        "      Decompress single-file .aplz directly to <out_file>\n\n"
+        "  %s l <archive.aplz>\n"
         "      List archive entries and dedup/pack summary (O(1) footer read)\n\n"
-        "  %s t <archive.asz>\n"
+        "  %s t <archive.aplz>\n"
         "      Verify full integrity (Header + Pack + Block + File CRC32C)\n",
         prog, prog, prog, prog, prog);
 }
@@ -91,7 +91,7 @@ int main(int argc, const char* argv[]) {
                 return 0;
             }
             if (arg1 == "-V" || arg1 == "--version" || arg1 == "version") {
-                printf("asz %s\n", ASZ_CLI_VERSION);
+                printf("aplz %s\n", APLZ_CLI_VERSION);
                 return 0;
             }
         }
@@ -105,12 +105,12 @@ int main(int argc, const char* argv[]) {
 
         AszArchiver arc;
         if (!arc.init(shader_dir.c_str(), false)) {
-            fprintf(stderr, "[ERR] Failed to initialize AszArchiver.\n");
+            fprintf(stderr, "[ERR] Failed to initialize APLZ archiver.\n");
             return 1;
         }
 
-        // ── Create (`c` / `create`) ────────────────────────────────────────────
-        if (cmd == "c" || cmd == "create") {
+        // ── Create (`c` / `create` / `compress`) ───────────────────────────────
+        if (cmd == "c" || cmd == "create" || cmd == "compress") {
             AszCreateOptions opts;
             std::string out_path;
             std::vector<std::string> inputs;
@@ -134,7 +134,7 @@ int main(int argc, const char* argv[]) {
             }
             if (inputs.empty()) { print_usage(argv[0]); return 1; }
             if (out_path.empty()) {
-                out_path = asz_strip_trailing_slashes(inputs[0]) + ".asz";
+                out_path = asz_strip_trailing_slashes(inputs[0]) + ".aplz";
             }
 
             AszCreateStats st;
@@ -168,7 +168,7 @@ int main(int argc, const char* argv[]) {
 
         // ── Extract (`x` / `extract`) ──────────────────────────────────────────
         if (cmd == "x" || cmd == "extract") {
-            std::string asz_path = argv[2];
+            std::string arc_path = argv[2];
             std::string out_dir  = ".";
             std::vector<std::string> filters;
             bool quiet = false;
@@ -181,7 +181,7 @@ int main(int argc, const char* argv[]) {
             }
 
             AszExtractStats st;
-            if (!arc.extract(asz_path, out_dir, filters, &st)) {
+            if (!arc.extract(arc_path, out_dir, filters, &st)) {
                 fprintf(stderr, "[ERR] extract failed: %s\n", arc.last_error.c_str());
                 return 1;
             }
@@ -202,12 +202,12 @@ int main(int argc, const char* argv[]) {
         // ── Single-file direct decompress (`d`) ────────────────────────────────
         if (cmd == "d" || cmd == "decompress") {
             if (argc < 4) { print_usage(argv[0]); return 1; }
-            std::string asz_path = argv[2];
+            std::string arc_path = argv[2];
             std::string out_file = argv[3];
             bool quiet = (argc >= 5 && (strcmp(argv[4], "-q") == 0 || strcmp(argv[4], "--quiet") == 0));
 
             AszExtractStats st;
-            if (!arc.extract_single_file(asz_path, out_file, &st)) {
+            if (!arc.extract_single_file(arc_path, out_file, &st)) {
                 fprintf(stderr, "[ERR] decompress failed: %s\n", arc.last_error.c_str());
                 return 1;
             }
@@ -216,7 +216,7 @@ int main(int argc, const char* argv[]) {
                                  ? ((double)st.extracted_bytes / (1024.0 * 1024.0) / st.elapsed_s)
                                  : 0.0;
                 printf("Decompressed %s -> %s (%s) in %.1f ms (%.0f MB/s)\n",
-                       asz_path.c_str(), out_file.c_str(), fmt_bytes(st.extracted_bytes).c_str(),
+                       arc_path.c_str(), out_file.c_str(), fmt_bytes(st.extracted_bytes).c_str(),
                        st.elapsed_s * 1e3, mbs);
             }
             return 0;
@@ -224,18 +224,18 @@ int main(int argc, const char* argv[]) {
 
         // ── List (`l` / `list`) ────────────────────────────────────────────────
         if (cmd == "l" || cmd == "list") {
-            std::string asz_path = argv[2];
+            std::string arc_path = argv[2];
             std::vector<AszListEntry> list;
             AszArchiveSummary sum;
             CFTimeInterval t0 = CACurrentMediaTime();
-            if (!arc.list(asz_path, list, sum)) {
+            if (!arc.list(arc_path, list, sum)) {
                 fprintf(stderr, "[ERR] list failed: %s\n", arc.last_error.c_str());
                 return 1;
             }
             double ms = (CACurrentMediaTime() - t0) * 1e3;
 
-            printf("Archive: %s (ASZ v%u, L%u, flags=%s%s)\n",
-                   asz_path.c_str(), sum.version, sum.level,
+            printf("Archive: %s (APLZ v%u, L%u, flags=%s%s)\n",
+                   arc_path.c_str(), sum.version, sum.level,
                    (sum.flags & ASZ_FLAG_DEDUP) ? "DEDUP " : "",
                    (sum.flags & ASZ_FLAG_SOLID) ? "SOLID" : "");
             double ratio = (sum.total_raw_bytes > 0)
@@ -267,18 +267,18 @@ int main(int argc, const char* argv[]) {
             return 0;
         }
 
-        // ── Verify (`t` / `test`) ──────────────────────────────────────────────
-        if (cmd == "t" || cmd == "test") {
-            std::string asz_path = argv[2];
+        // ── Verify (`t` / `test` / `verify`) ───────────────────────────────────
+        if (cmd == "t" || cmd == "test" || cmd == "verify") {
+            std::string arc_path = argv[2];
             AszExtractStats st;
-            if (!arc.verify(asz_path, &st)) {
+            if (!arc.verify(arc_path, &st)) {
                 fprintf(stderr, "[FAIL] Integrity check FAILED: %s\n", arc.last_error.c_str());
                 return 1;
             }
             double mbs = (st.elapsed_s > 0.0)
                              ? ((double)st.extracted_bytes / (1024.0 * 1024.0) / st.elapsed_s) : 0.0;
             printf("[OK] Verified %s: %u files, %u dirs, %u symlinks (%s, %u packs) in %.1f ms (%.0f MB/s)\n",
-                   asz_path.c_str(), st.extracted_files, st.extracted_dirs, st.extracted_links,
+                   arc_path.c_str(), st.extracted_files, st.extracted_dirs, st.extracted_links,
                    fmt_bytes(st.extracted_bytes).c_str(), st.packs_decoded, st.elapsed_s * 1e3, mbs);
             return 0;
         }

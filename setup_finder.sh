@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# setup_finder.sh — APLZ-X (.asz) macOS Finder サービス / クイックアクション自動セットアップ
+# setup_finder.sh — APLZ v4 (.aplz) macOS Finder サービス / クイックアクション自動セットアップ
 #
 # Finder の右クリックメニュー（「サービス」または「クイックアクション」）に以下を登録します:
-#   - 「APLZ で圧縮」: 選択したファイル／フォルダを .asz 形式で高速圧縮
-#   - 「APLZ で解凍」: 選択した .asz ファイルを解凍（全層 CRC32C 検証つき）
+#   - 「APLZ で圧縮」: 選択したファイル／フォルダを .aplz 形式で高速圧縮
+#   - 「APLZ で解凍」: 選択した .aplz ファイルを解凍（全層 CRC32C 検証つき）
 #
 # 特長:
-#   - 同名ファイル／フォルダが存在する場合は自動リネーム（例: foo 2.asz / foo 2）し上書き防止
+#   - 同名ファイル／フォルダが存在する場合は自動リネーム（例: foo 2.aplz / foo 2）し上書き防止
 #   - 同一ボリューム上での一時作業＋アトミック移動により外付け SSD でも二重コピーゼロ
 #   - 直接読み込みに失敗するクラウドドライブ（Google Drive / iCloud 等）では自動リトライ退避
 #   - 日本語・スペース・引用符を含むファイル名および通知メッセージに完全対応
@@ -39,12 +39,12 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
-find_asz() {
+find_aplz() {
     local candidates=(
-        "$HOME/.local/bin/asz"
-        "/usr/local/bin/asz"
-        "/opt/homebrew/bin/asz"
-        "$ROOT_DIR/build/asz"
+        "$HOME/.local/bin/aplz"
+        "/usr/local/bin/aplz"
+        "/opt/homebrew/bin/aplz"
+        "$ROOT_DIR/build/aplz"
     )
     for c in "${candidates[@]}"; do
         [[ -x "$c" ]] && echo "$c" && return
@@ -52,13 +52,13 @@ find_asz() {
     echo ""
 }
 
-ASZ_PATH="$(find_asz)"
-if [[ -z "$ASZ_PATH" ]]; then
-    echo "[ERR] asz command not found. Run ./install.sh first." >&2
+APLZ_PATH="$(find_aplz)"
+if [[ -z "$APLZ_PATH" ]]; then
+    echo "[ERR] aplz command not found. Run ./install.sh first." >&2
     exit 1
 fi
 
-echo "==> Using asz: ${ASZ_PATH}"
+echo "==> Using aplz: ${APLZ_PATH}"
 
 # ─── Automator Quick Action / Service ワークフロー生成 ──────────────────────────
 create_workflow() {
@@ -70,12 +70,12 @@ create_workflow() {
     rm -rf "$wf_root"
     mkdir -p "$wf_dir"
 
-    /usr/bin/python3 - "$name" "$wf_dir" "$shell_script" "$ASZ_PATH" <<'PYEOF'
+    /usr/bin/python3 - "$name" "$wf_dir" "$shell_script" "$APLZ_PATH" <<'PYEOF'
 import os, sys, uuid
 from xml.sax.saxutils import escape
 
-name, wf_dir, script, asz_path = sys.argv[1:5]
-script = script.replace("__ASZ_FALLBACK__", asz_path)
+name, wf_dir, script, aplz_path = sys.argv[1:5]
+script = script.replace("__APLZ_FALLBACK__", aplz_path)
 
 u1, u2, u3 = str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper()
 esc_name = escape(name, {'"': '&quot;'})
@@ -336,7 +336,7 @@ PYEOF
 
 mkdir -p "$SERVICES_DIR"
 
-# ─── 1. 圧縮ワークフロー用シェルスクリプト (APLZ-X .asz) ────────────────────────
+# ─── 1. 圧縮ワークフロー用シェルスクリプト (APLZ v4 .aplz) ──────────────────────
 read -r -d '' COMPRESS_SCRIPT <<'EOF' || true
 export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 export LANG="ja_JP.UTF-8"
@@ -345,7 +345,7 @@ export LC_CTYPE="UTF-8"
 exec >> /tmp/aplz_service.log 2>&1
 echo "=== $(date) [compress] ==="
 
-ASZ_FALLBACK="__ASZ_FALLBACK__"
+APLZ_FALLBACK="__APLZ_FALLBACK__"
 
 notify() {
     osascript \
@@ -355,9 +355,9 @@ notify() {
         -- "$1" "$2" "$3" >/dev/null 2>&1 || true
 }
 
-resolve_asz() {
+resolve_aplz() {
     local c
-    for c in "$HOME/.local/bin/asz" "/usr/local/bin/asz" "/opt/homebrew/bin/asz" "$ASZ_FALLBACK"; do
+    for c in "$HOME/.local/bin/aplz" "/usr/local/bin/aplz" "/opt/homebrew/bin/aplz" "$APLZ_FALLBACK"; do
         if [ -x "$c" ]; then
             echo "$c"
             return 0
@@ -432,9 +432,9 @@ stage_tree() {
     done < <(find "$src" -print0)
 }
 
-ASZ_BIN="$(resolve_asz)" || {
-    echo "[ERR] asz binary not found"
-    notify "APLZ" "圧縮失敗" "asz コマンドが見つかりません"
+APLZ_BIN="$(resolve_aplz)" || {
+    echo "[ERR] aplz binary not found"
+    notify "APLZ" "圧縮失敗" "aplz コマンドが見つかりません"
     exit 1
 }
 
@@ -459,14 +459,14 @@ for raw_f in "$@"; do
     echo "compressing [${index}/${total}]: $f"
     notify "APLZ" "圧縮中 (${index}/${total})" "$base"
 
-    work_root="$(mktemp -d "${dir}/.asz_work_XXXXXX" 2>/dev/null || mktemp -d /tmp/asz_work.XXXXXX)"
+    work_root="$(mktemp -d "${dir}/.aplz_work_XXXXXX" 2>/dev/null || mktemp -d /tmp/aplz_work.XXXXXX)"
     _active_work="$work_root"
-    tmp_out="${work_root}/${base}.asz"
-    log_out="${work_root}/asz.out"
+    tmp_out="${work_root}/${base}.aplz"
+    log_out="${work_root}/aplz.out"
     rc=0
 
     # 高速ゼロコピー直圧縮を試行
-    if "$ASZ_BIN" c -3 -o "$tmp_out" "$f" > "$log_out" 2>&1; then
+    if "$APLZ_BIN" c -3 -o "$tmp_out" "$f" > "$log_out" 2>&1; then
         rc=0
     else
         cat "$log_out" 2>/dev/null || true
@@ -474,13 +474,13 @@ for raw_f in "$@"; do
         rm -f "$tmp_out"
         staged="${work_root}/${base}"
         if [ -d "$f" ] && [ ! -L "$f" ]; then
-            if stage_tree "$f" "$staged" && "$ASZ_BIN" c -3 -o "$tmp_out" "$staged" > "$log_out" 2>&1; then
+            if stage_tree "$f" "$staged" && "$APLZ_BIN" c -3 -o "$tmp_out" "$staged" > "$log_out" 2>&1; then
                 rc=0
             else
                 rc=$?
             fi
         else
-            if copy_with_retry "$f" "$staged" && "$ASZ_BIN" c -3 -o "$tmp_out" "$staged" > "$log_out" 2>&1; then
+            if copy_with_retry "$f" "$staged" && "$APLZ_BIN" c -3 -o "$tmp_out" "$staged" > "$log_out" 2>&1; then
                 rc=0
             else
                 rc=$?
@@ -491,7 +491,7 @@ for raw_f in "$@"; do
     cat "$log_out" 2>/dev/null || true
 
     if [ $rc -eq 0 ] && [ -f "$tmp_out" ]; then
-        target="$(unique_path "$dir" "${base}.asz" 0)"
+        target="$(unique_path "$dir" "${base}.aplz" 0)"
         if mv "$tmp_out" "$target" 2>/dev/null || (cp "$tmp_out" "$target" && rm -f "$tmp_out"); then
             out_name="$(basename "$target")"
             summary="$(awk -F'|' '/^[[:space:]]*Size[[:space:]]*:/ {s=$1; sub(/^[[:space:]]*Size[[:space:]]*:[[:space:]]*/, "", s); sub(/[[:space:]]*$/, "", s); print s; exit}' "$log_out" 2>/dev/null || true)"
@@ -516,7 +516,7 @@ for raw_f in "$@"; do
 done
 EOF
 
-# ─── 2. 解凍ワークフロー用シェルスクリプト (APLZ-X .asz 専用) ───────────────────
+# ─── 2. 解凍ワークフロー用シェルスクリプト (APLZ v4 .aplz 専用) ─────────────────
 read -r -d '' EXTRACT_SCRIPT <<'EOF' || true
 export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 export LANG="ja_JP.UTF-8"
@@ -525,7 +525,7 @@ export LC_CTYPE="UTF-8"
 exec >> /tmp/aplz_service.log 2>&1
 echo "=== $(date) [decompress] ==="
 
-ASZ_FALLBACK="__ASZ_FALLBACK__"
+APLZ_FALLBACK="__APLZ_FALLBACK__"
 
 notify() {
     osascript \
@@ -535,9 +535,9 @@ notify() {
         -- "$1" "$2" "$3" >/dev/null 2>&1 || true
 }
 
-resolve_asz() {
+resolve_aplz() {
     local c
-    for c in "$HOME/.local/bin/asz" "/usr/local/bin/asz" "/opt/homebrew/bin/asz" "$ASZ_FALLBACK"; do
+    for c in "$HOME/.local/bin/aplz" "/usr/local/bin/aplz" "/opt/homebrew/bin/aplz" "$APLZ_FALLBACK"; do
         if [ -x "$c" ]; then
             echo "$c"
             return 0
@@ -589,8 +589,8 @@ copy_with_retry() {
     return 1
 }
 
-read_magic4() {
-    LC_ALL=C dd if="$1" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \t\n'
+read_magic8() {
+    LC_ALL=C dd if="$1" bs=8 count=1 2>/dev/null | od -An -tx1 | tr -d ' \t\n'
 }
 
 EXTRACTED_DEST=""
@@ -633,9 +633,9 @@ move_extracted_tree() {
     fi
 }
 
-ASZ_BIN="$(resolve_asz)" || {
-    echo "[ERR] asz binary not found"
-    notify "APLZ" "解凍失敗" "asz コマンドが見つかりません"
+APLZ_BIN="$(resolve_aplz)" || {
+    echo "[ERR] aplz binary not found"
+    notify "APLZ" "解凍失敗" "aplz コマンドが見つかりません"
     exit 1
 }
 
@@ -660,35 +660,40 @@ for raw_f in "$@"; do
     echo "extracting [${index}/${total}]: $f"
     notify "APLZ" "解凍中 (${index}/${total})" "$base"
 
-    work_root="$(mktemp -d "${dir}/.asz_extract_XXXXXX" 2>/dev/null || mktemp -d /tmp/asz_extract.XXXXXX)"
+    work_root="$(mktemp -d "${dir}/.aplz_extract_XXXXXX" 2>/dev/null || mktemp -d /tmp/aplz_extract.XXXXXX)"
     _active_work="$work_root"
     stage_dir="${work_root}/out"
     mkdir -p "$stage_dir"
 
     src_file="$f"
-    magic="$(read_magic4 "$src_file")"
-    if [ -z "$magic" ]; then
+    magic8="$(read_magic8 "$src_file")"
+    if [ -z "$magic8" ]; then
         if copy_with_retry "$f" "${work_root}/${base}"; then
             src_file="${work_root}/${base}"
-            magic="$(read_magic4 "$src_file")"
+            magic8="$(read_magic8 "$src_file")"
         fi
     fi
 
-    if [ "$magic" != "41535a01" ]; then
-        echo "[ERR] Not an .asz archive (magic=${magic:-none}): $f"
-        notify "APLZ" "非対応の形式" "${base} は .asz アーカイブではありません"
+    if [ "$magic8" != "41504c5a04000000" ]; then
+        if [[ "$magic8" == 41504c5a* ]]; then
+            echo "[ERR] Unsupported legacy APLZ version (magic8=${magic8}): $f"
+            notify "APLZ" "非対応の旧バージョン" "${base} は旧 APLZ 形式です（APLZ v4 非対応）"
+        else
+            echo "[ERR] Not an APLZ v4 archive (magic8=${magic8:-none}): $f"
+            notify "APLZ" "非対応の形式" "${base} は .aplz アーカイブではありません"
+        fi
         rm -rf "$work_root"
         _active_work=""
         continue
     fi
 
     rc=0
-    if "$ASZ_BIN" x "$src_file" -C "$stage_dir"; then
+    if "$APLZ_BIN" x "$src_file" -C "$stage_dir"; then
         rc=0
     elif [ "$src_file" = "$f" ]; then
         echo "direct extract failed, retrying via local staging..."
         rm -rf "$stage_dir" && mkdir -p "$stage_dir"
-        if copy_with_retry "$f" "${work_root}/${base}" && "$ASZ_BIN" x "${work_root}/${base}" -C "$stage_dir"; then
+        if copy_with_retry "$f" "${work_root}/${base}" && "$APLZ_BIN" x "${work_root}/${base}" -C "$stage_dir"; then
             rc=0
         else
             rc=$?
@@ -698,7 +703,7 @@ for raw_f in "$@"; do
     fi
 
     if [ $rc -eq 0 ]; then
-        fallback="${base%.asz}"
+        fallback="${base%.aplz}"
         [ "$fallback" = "$base" ] && fallback="${base}_extracted"
         if move_extracted_tree "$stage_dir" "$dir" "$fallback"; then
             echo "done: $EXTRACTED_DEST"
@@ -731,11 +736,11 @@ echo "============================================================"
 echo " Finder サービス / クイックアクションをインストールしました"
 echo ""
 echo " 登録されたサービス:"
-echo "   - APLZ で圧縮  → 選択したファイル／フォルダを .asz 圧縮"
-echo "   - APLZ で解凍  → 選択した .asz ファイルを解凍"
+echo "   - APLZ で圧縮  → 選択したファイル／フォルダを .aplz 圧縮"
+echo "   - APLZ で解凍  → 選択した .aplz ファイルを解凍"
 echo ""
 echo " 動作仕様:"
-echo "   - 同名ファイル／フォルダがある場合は自動リネーム (例: foo 2.asz / foo 2)"
+echo "   - 同名ファイル／フォルダがある場合は自動リネーム (例: foo 2.aplz / foo 2)"
 echo "   - ログ出力先: /tmp/aplz_service.log"
 echo ""
 echo " アンインストール:"

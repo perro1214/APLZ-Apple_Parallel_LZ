@@ -78,7 +78,7 @@ static void gen_dataset(std::vector<uint8_t>& dst, size_t size, int kind, const 
             "README.md", "README.ja.md", "SPEC.md",
             "src/rans/rans32.metal", "src/rans/rans32_cpu.h",
             "src/engine/hetero_lz.h", "src/engine/hetero_engine.h", "src/engine/hetero_kernels.metal",
-            "src/asz/asz_archiver.h", "src/asz/asz_main.mm"
+            "src/archive/aplz_archiver.h", "src/archive/aplz_main.mm"
         };
         std::vector<uint8_t> corpus;
         for (const char* rel : files) {

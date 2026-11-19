@@ -1,4 +1,4 @@
-// test_phase3.mm — APLZ-X Phase 3: `.asz` 包括的正当性・重複排除・部分展開・セキュリティ検証スイート
+// test_archive.mm — APLZ v4 (`.aplz`) 包括的正当性・重複排除・部分展開・セキュリティ検証スイート
 #import <Foundation/Foundation.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,7 +8,7 @@
 #include <vector>
 #include <string>
 
-#include "../src/asz/asz_archiver.h"
+#include "../src/archive/aplz_archiver.h"
 
 static uint64_t g_rng = 0x123456789ABCDEF0ULL;
 static inline uint64_t next_rng() {
@@ -63,7 +63,7 @@ int main(int argc, const char* argv[]) {
         if (!td_c) { fprintf(stderr, "[FAIL] mkdtemp failed\n"); return 1; }
         std::string td = td_c;
 
-        printf("=== Phase 3 (.asz) Automated Verification Suite ===\n");
+        printf("=== Phase 3 (.aplz) Automated Verification Suite ===\n");
 
         // ── Test 1: 境界サイズ単一ファイル往復 (0B .. 524300B, L1/L3/L6) ────────
         {
@@ -72,7 +72,7 @@ int main(int argc, const char* argv[]) {
                 std::vector<uint8_t> buf(sz);
                 for (size_t i = 0; i < sz; ++i) buf[i] = (uint8_t)((i * 31u + (i >> 6u)) & 0xFFu);
                 std::string fpath = td + "/t1_in.bin";
-                std::string apath = td + "/t1.asz";
+                std::string apath = td + "/t1.aplz";
                 std::string dpath = td + "/t1_out.bin";
                 write_bytes(fpath, buf.data(), buf.size());
 
@@ -127,7 +127,7 @@ int main(int argc, const char* argv[]) {
             write_bytes(root + "/data/v1.fp32", f32.data(), f32.size());
             write_bytes(root + "/data/v2_copy.fp32", f32.data(), f32.size());
 
-            std::string apath = td + "/proj.asz";
+            std::string apath = td + "/proj.aplz";
             AszCreateOptions opt; opt.level = 3u;
             AszCreateStats cs;
             if (!arc.create({ root }, apath, opt, &cs)) {
@@ -184,7 +184,7 @@ int main(int argc, const char* argv[]) {
             write_bytes(d + "/v1.bin", base.data(), base.size());
             write_bytes(d + "/v2_shifted.bin", shifted.data(), shifted.size());
 
-            std::string apath = td + "/shift.asz";
+            std::string apath = td + "/shift.aplz";
             AszCreateOptions opt; opt.level = 1u; opt.enable_dedup = true;
             AszCreateStats cs;
             if (!arc.create({ d }, apath, opt, &cs)) {
@@ -223,7 +223,7 @@ int main(int argc, const char* argv[]) {
                 snprintf(fn, sizeof(fn), "/mod_%03d.hpp", k);
                 write_bytes(d + fn, (const uint8_t*)body.data(), body.size());
             }
-            std::string apath = td + "/solid.asz";
+            std::string apath = td + "/solid.aplz";
             AszCreateOptions opt; opt.level = 3u; opt.enable_solid = true;
             AszCreateStats cs;
             if (!arc.create({ d }, apath, opt, &cs)) {
@@ -252,7 +252,7 @@ int main(int argc, const char* argv[]) {
             while (needle.size() < 4096u) needle += "Line padding for 4 KiB target file inside 16 MiB archive.\n";
             write_bytes(d + "/needle.txt", (const uint8_t*)needle.data(), needle.size());
 
-            std::string apath = td + "/partial.asz";
+            std::string apath = td + "/partial.aplz";
             AszCreateOptions opt; opt.level = 1u;
             if (!arc.create({ d }, apath, opt)) {
                 fprintf(stderr, "[FAIL] T5 create: %s\n", arc.last_error.c_str()); rm_rf(td); return 1;
@@ -278,7 +278,7 @@ int main(int argc, const char* argv[]) {
 
         // ── Test 6: 3 重破損検知 (Header / Pack / Central Directory の 1-bit 反転) ─
         {
-            std::string apath = td + "/proj.asz";
+            std::string apath = td + "/proj.aplz";
             auto orig = read_bytes(apath);
             AszFileHeader fh;
             memcpy(&fh, orig.data(), sizeof(fh));
@@ -291,7 +291,7 @@ int main(int argc, const char* argv[]) {
             for (int k = 0; k < 3; ++k) {
                 auto bad = orig;
                 bad[flip_locs[k]] ^= 0x01u;
-                std::string bad_p = td + "/bad_" + std::to_string(k) + ".asz";
+                std::string bad_p = td + "/bad_" + std::to_string(k) + ".aplz";
                 write_bytes(bad_p, bad.data(), bad.size());
                 if (arc.verify(bad_p)) {
                     fprintf(stderr, "[FAIL] T6 corruption #%d was NOT detected!\n", k);
@@ -353,8 +353,23 @@ int main(int argc, const char* argv[]) {
             printf("  [PASS] Test 8: GF(2) hx_crc32c_combine bit-exact across boundary & multi-chunk splits\n");
         }
 
+        // ── Test 9: 旧 APLZ v3 ヘッダの安全拒否 (APLZ v4 専用) ────────────────────
+        {
+            std::vector<uint8_t> old_v3(64, 0);
+            memcpy(old_v3.data(), "APLZ", 4);
+            uint32_t v3 = 3u;
+            memcpy(old_v3.data() + 4, &v3, 4);
+            std::string v3_p = td + "/legacy_v3.aplz";
+            write_bytes(v3_p, old_v3.data(), old_v3.size());
+            if (arc.verify(v3_p)) {
+                fprintf(stderr, "[FAIL] T9 legacy v3 file was NOT rejected!\n");
+                rm_rf(td); return 1;
+            }
+            printf("  [PASS] Test 9: Legacy APLZ v3 header cleanly rejected (%s)\n", arc.last_error.c_str());
+        }
+
         rm_rf(td);
-        printf("=== ALL 8 PHASE 3 TESTS PASSED! ===\n");
+        printf("=== ALL 9 APLZ v4 ARCHIVE TESTS PASSED! ===\n");
         return 0;
     }
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build.sh — APLZ-X (.asz) 統合ビルド & テストスクリプト (macOS / Apple Silicon)
+# build.sh — APLZ v4 (.aplz) 統合ビルド & テストスクリプト (macOS / Apple Silicon)
 #
 # 使い方:
-#   ./build.sh           # asz CLI + Metal カーネル + 全テスト／ベンチバイナリを build/ へビルド
+#   ./build.sh           # aplz CLI + Metal カーネル + 全テスト／ベンチバイナリを build/ へビルド
 #   ./build.sh test      # ビルド後に自動検証スイートを実行
 #   ./build.sh clean     # build/ を削除
 set -euo pipefail
@@ -31,28 +31,28 @@ COMMON_FLAGS=(
     -framework Foundation -framework Metal -framework QuartzCore
 )
 
-echo "==> [2/4] Building asz CLI..."
-clang++ "${COMMON_FLAGS[@]}" "$ROOT_DIR/src/asz/asz_main.mm" -o "$BUILD_DIR/asz"
+echo "==> [2/4] Building aplz CLI..."
+clang++ "${COMMON_FLAGS[@]}" "$ROOT_DIR/src/archive/aplz_main.mm" -o "$BUILD_DIR/aplz"
 
-echo "==> [3/4] Building test_phase3..."
-clang++ "${COMMON_FLAGS[@]}" "$ROOT_DIR/tests/test_phase3.mm" -o "$BUILD_DIR/test_phase3"
+echo "==> [3/4] Building test_archive..."
+clang++ "${COMMON_FLAGS[@]}" "$ROOT_DIR/tests/test_archive.mm" -o "$BUILD_DIR/test_archive"
 
 echo "==> [4/4] Building benchmarks (bench_rans32, bench_phase2)..."
 clang++ "${COMMON_FLAGS[@]}" "$ROOT_DIR/tests/bench_rans32.mm" -o "$BUILD_DIR/bench_rans32"
 clang++ "${COMMON_FLAGS[@]}" "$ROOT_DIR/tests/bench_phase2.mm" -o "$BUILD_DIR/bench_phase2"
 
 echo "==> Build complete:"
-echo "    $BUILD_DIR/asz"
+echo "    $BUILD_DIR/aplz"
 echo "    $BUILD_DIR/hetero_kernels.metallib"
-echo "    $BUILD_DIR/test_phase3"
+echo "    $BUILD_DIR/test_archive"
 echo "    $BUILD_DIR/bench_rans32"
 echo "    $BUILD_DIR/bench_phase2"
 
 if [[ "${1:-}" == "test" ]]; then
     echo ""
-    echo "==> Running Phase 3 automated test suite..."
-    "$BUILD_DIR/test_phase3" "$BUILD_DIR"
+    echo "==> Running APLZ v4 automated test suite..."
+    "$BUILD_DIR/test_archive" "$BUILD_DIR"
     echo ""
     echo "==> Running CLI version & smoke check..."
-    "$BUILD_DIR/asz" --version
+    "$BUILD_DIR/aplz" --version
 fi
