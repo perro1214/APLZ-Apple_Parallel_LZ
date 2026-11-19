@@ -1,146 +1,90 @@
 #!/usr/bin/env bash
-# install.sh — APLZ インストーラ
+# install.sh — APLZ-X (.asz) ビルド & インストーラ (Apple Silicon / macOS)
 #
-# Usage:
-#   ./install.sh              ~/.local/bin にインストール (デフォルト)
-#   ./install.sh /usr/local   /usr/local/bin にインストール (sudo 必要)
-#   ./install.sh uninstall    アンインストール
-#
-# 実行内容:
-#   1. -O3 -flto による最適化ビルド
-#   2. gpu_zip, aplz, compression.metal を PREFIX/bin にインストール
-#   3. PATH 設定の案内
-
+# 使い方:
+#   ./install.sh                     # ~/.local/bin/asz へインストール (sudo 不要)
+#   ./install.sh --system            # /usr/local/bin/asz へシステムインストール
+#   ./install.sh --prefix /opt/asz   # 任意プレフィックスへインストール
+#   ./install.sh --uninstall         # アンインストール
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PREFIX="${PREFIX:-$HOME/.local}"
+UNINSTALL=0
+USE_SUDO=""
 
-SRC="${SCRIPT_DIR}/main.mm"
-SHADER="${SCRIPT_DIR}/compression.metal"
-WRAPPER="${SCRIPT_DIR}/aplz"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --prefix)
+            PREFIX="$2"; shift 2 ;;
+        --system)
+            PREFIX="/usr/local"; shift ;;
+        --uninstall|uninstall)
+            UNINSTALL=1; shift ;;
+        -h|--help)
+            sed -n '2,8p' "$0" | sed 's/^# \?//'
+            exit 0 ;;
+        *)
+            echo "[ERR] Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
 
-DEFAULT_PREFIX="$HOME/.local"
+BIN_DIR="$PREFIX/bin"
+SHARE_DIR="$PREFIX/share/asz"
 
-# ─── アンインストール ────────────────────────────────────────────────────────
-if [[ "${1:-}" == "uninstall" ]]; then
-    echo "==> Uninstalling APLZ..."
-    for prefix in "$HOME/.local" "/usr/local"; do
-        local_bin="${prefix}/bin"
-        for f in gpu_zip aplz compression.metal compression.metallib; do
-            if [[ -f "${local_bin}/${f}" ]]; then
-                echo "    Removing: ${local_bin}/${f}"
-                rm -f "${local_bin}/${f}" 2>/dev/null || sudo rm -f "${local_bin}/${f}"
-            fi
-        done
-    done
-    echo "Done. Run './setup_finder.sh uninstall' to remove Finder actions."
+CHECK_DIR="$PREFIX"
+while [[ ! -e "$CHECK_DIR" && "$CHECK_DIR" != "/" ]]; do
+    CHECK_DIR="$(dirname "$CHECK_DIR")"
+done
+if [[ ! -w "$CHECK_DIR" ]]; then
+    USE_SUDO="sudo"
+fi
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+    echo "==> Uninstalling asz from $PREFIX"
+    $USE_SUDO rm -f "$BIN_DIR/asz" "$SHARE_DIR/hetero_kernels.metallib"
+    $USE_SUDO rmdir "$SHARE_DIR" 2>/dev/null || true
+    echo "==> Done."
     exit 0
 fi
 
-PREFIX="${1:-$DEFAULT_PREFIX}"
-BIN_DIR="${PREFIX}/bin"
-
-echo "============================================================"
-echo " APLZ Installer"
-echo " Install to: ${BIN_DIR}"
-echo "============================================================"
-echo ""
-
-# ─── 依存チェック ────────────────────────────────────────────────────────────
-if ! command -v xcrun &>/dev/null; then
-    echo "Error: Xcode Command Line Tools not found." >&2
-    echo "Install with: xcode-select --install" >&2
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "[ERR] APLZ-X (asz) requires macOS with Apple Metal." >&2
     exit 1
 fi
 
-# ─── Metal シェーダコンパイル ────────────────────────────────────────────────
-echo "==> Compiling Metal shader (optimized)..."
-xcrun -sdk macosx metal \
-    -std=metal3.0 \
-    -O2 \
-    -Wall \
-    -Wno-unused-variable \
-    -c "$SHADER" \
-    -o "${SCRIPT_DIR}/compression.air"
+TMP_BUILD="$(mktemp -d /tmp/asz_install_XXXXXX)"
+trap 'rm -rf "$TMP_BUILD"' EXIT
 
-xcrun -sdk macosx metallib \
-    "${SCRIPT_DIR}/compression.air" \
-    -o "${SCRIPT_DIR}/compression.metallib"
+echo "==> [1/3] Compiling Metal 3.0 compute kernels (hetero_kernels.metallib)..."
+xcrun -sdk macosx metal -std=metal3.0 -O3 -c "$ROOT_DIR/src/engine/hetero_kernels.metal" -o "$TMP_BUILD/hetero_kernels.air"
+xcrun -sdk macosx metallib "$TMP_BUILD/hetero_kernels.air" -o "$TMP_BUILD/hetero_kernels.metallib"
 
-echo "    -> compression.metallib"
+echo "==> [2/3] Compiling asz CLI (-O3 -flto -march=armv8.5-a+crc)..."
+clang++ -std=c++17 -O3 -flto -march=armv8.5-a+crc -Wall -Wextra \
+    -fobjc-arc \
+    -framework Foundation -framework Metal -framework QuartzCore \
+    "$ROOT_DIR/src/asz/asz_main.mm" -o "$TMP_BUILD/asz"
 
-# ─── ホストコード最適化ビルド ────────────────────────────────────────────────
-SDK=$(xcrun --sdk macosx --show-sdk-path)
-echo "==> Building gpu_zip with -O3 -flto (SDK: ${SDK})..."
+echo "==> [3/3] Installing to $PREFIX..."
+$USE_SUDO mkdir -p "$BIN_DIR" "$SHARE_DIR"
+$USE_SUDO install -m 755 "$TMP_BUILD/asz" "$BIN_DIR/asz"
+$USE_SUDO install -m 644 "$TMP_BUILD/hetero_kernels.metallib" "$SHARE_DIR/hetero_kernels.metallib"
 
-clang++ \
-    -std=c++17 \
-    -O3 \
-    -flto \
-    -DNDEBUG \
-    -Wall \
-    -Wextra \
-    -Wno-unused-parameter \
-    -isysroot "$SDK" \
-    -framework Metal \
-    -framework Foundation \
-    -framework QuartzCore \
-    -o "${SCRIPT_DIR}/gpu_zip" \
-    "$SRC"
+# Smoke test
+echo "==> Running installation smoke test..."
+"$BIN_DIR/asz" --version
+"$BIN_DIR/asz" c -3 -q -o "$TMP_BUILD/smoke.asz" "$ROOT_DIR/SPEC.md"
+"$BIN_DIR/asz" t "$TMP_BUILD/smoke.asz" >/dev/null
+"$BIN_DIR/asz" d "$TMP_BUILD/smoke.asz" "$TMP_BUILD/SPEC.out" -q
+cmp -s "$ROOT_DIR/SPEC.md" "$TMP_BUILD/SPEC.out"
+echo "==> Installed successfully: $BIN_DIR/asz"
 
-echo "    -> gpu_zip (optimized)"
-
-# ─── インストール ────────────────────────────────────────────────────────────
-echo "==> Installing to ${BIN_DIR}..."
-mkdir -p "$BIN_DIR"
-
-NEED_SUDO=false
-if [[ ! -w "$BIN_DIR" ]]; then
-    NEED_SUDO=true
-    echo "    (requires sudo for ${BIN_DIR})"
-fi
-
-do_install() {
-    local src="$1" dst="$2" mode="${3:-755}"
-    if $NEED_SUDO; then
-        sudo install -m "$mode" "$src" "$dst"
-    else
-        install -m "$mode" "$src" "$dst"
-    fi
-}
-
-do_install "${SCRIPT_DIR}/gpu_zip" "${BIN_DIR}/gpu_zip" 755
-do_install "$WRAPPER"              "${BIN_DIR}/aplz"    755
-do_install "$SHADER"               "${BIN_DIR}/compression.metal" 644
-do_install "${SCRIPT_DIR}/compression.metallib" "${BIN_DIR}/compression.metallib" 644
-
-echo "    gpu_zip              -> ${BIN_DIR}/gpu_zip"
-echo "    aplz                 -> ${BIN_DIR}/aplz"
-echo "    compression.metal    -> ${BIN_DIR}/compression.metal"
-echo "    compression.metallib -> ${BIN_DIR}/compression.metallib"
-
-# ─── PATH チェック ───────────────────────────────────────────────────────────
-echo ""
-if echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
-    echo "==> ${BIN_DIR} is already in PATH."
-else
-    echo "==> Add to PATH (add to ~/.zshrc):"
-    echo ""
-    echo "    export PATH=\"${BIN_DIR}:\$PATH\""
-    echo ""
-fi
-
-# ─── 完了 ────────────────────────────────────────────────────────────────────
-echo "============================================================"
-echo " Installation complete!"
-echo ""
-echo " Quick start:"
-echo "   aplz compress myfile.txt          → myfile.txt.aplz"
-echo "   aplz extract  myfile.txt.aplz     → myfile.txt"
-echo "   aplz compress mydir/              → mydir.tar.aplz"
-echo "   aplz extract  mydir.tar.aplz      → mydir/"
-echo "   aplz info     myfile.txt.aplz"
-echo ""
-echo " Finder integration (optional):"
-echo "   ./setup_finder.sh"
-echo "============================================================"
+case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+        echo ""
+        echo "[NOTE] $BIN_DIR is not in your PATH. Add this to ~/.zshrc:"
+        echo "  export PATH=\"$BIN_DIR:\$PATH\""
+        ;;
+esac

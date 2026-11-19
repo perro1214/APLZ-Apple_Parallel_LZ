@@ -1,10 +1,17 @@
 # Build artifacts
+build/
+asz
+bench_rans32
+bench_phase2
+test_phase3
 gpu_zip
 *.o
 *.air
 *.metallib
 
-# Test data & output
+# Archives & test data
+*.asz
+*.asz2
 *.aplz
 *.bin
 decoded*
@@ -18,7 +25,6 @@ decoded*
 *.xcodeproj/
 xcuserdata/
 DerivedData/
-build/
 
 # Editor
 *.swp
@@ -27,9 +33,7 @@ build/
 .vscode/
 .idea/
 
-# Local notes
+# Local notes & tooling
 /blog.md
-/Users/hayato/project/GPU_ZIP/blog.md
-
-# Tooling
 .yomiyasu/
+.ruff_cache/

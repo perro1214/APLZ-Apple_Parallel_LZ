@@ -35,7 +35,7 @@
 
 #include "hetero_format.h"
 #include "hetero_lz.h"
-#include "../phase1_rans/rans32_cpu.h"
+#include "../rans/rans32_cpu.h"
 
 static_assert(sizeof(HxEncSym)   == sizeof(Rans32EncSym),   "EncSym ABI mismatch");
 static_assert(sizeof(HxTileMeta) == sizeof(Rans32TileMeta), "TileMeta ABI mismatch");

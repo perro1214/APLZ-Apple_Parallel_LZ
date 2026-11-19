@@ -1,23 +1,50 @@
 #!/usr/bin/env bash
-# setup_finder.sh — macOS Finder クイックアクション自動生成
+# setup_finder.sh — APLZ-X (.asz) macOS Finder サービス / クイックアクション自動セットアップ
 #
-# Finder の右クリックメニューに以下を追加:
-#   - 「APLZ で圧縮」: 選択したファイル/フォルダを .aplz / .tar.aplz に圧縮
-#   - 「APLZ で解凍」: 選択した .aplz ファイルを解凍
+# Finder の右クリックメニュー（「サービス」または「クイックアクション」）に以下を登録します:
+#   - 「APLZ で圧縮」: 選択したファイル／フォルダを .asz 形式で高速圧縮
+#   - 「APLZ で解凍」: 選択した .asz ファイルを解凍（全層 CRC32C 検証つき）
 #
-# 生成先: ~/Library/Services/*.workflow
-# 削除:   ./setup_finder.sh uninstall
+# 特長:
+#   - 同名ファイル／フォルダが存在する場合は自動リネーム（例: foo 2.asz / foo 2）し上書き防止
+#   - 同一ボリューム上での一時作業＋アトミック移動により外付け SSD でも二重コピーゼロ
+#   - 直接読み込みに失敗するクラウドドライブ（Google Drive / iCloud 等）では自動リトライ退避
+#   - 日本語・スペース・引用符を含むファイル名および通知メッセージに完全対応
+#
+# 使い方:
+#   ./setup_finder.sh              # インストール / 更新
+#   ./setup_finder.sh --uninstall  # アンインストール
 
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVICES_DIR="$HOME/Library/Services"
 
-# aplz コマンドのパスを検出
-find_aplz() {
+if [[ "${1:-}" == "--uninstall" || "${1:-}" == "uninstall" ]]; then
+    echo "==> Removing Finder services (APLZ で圧縮 / APLZ で解凍)..."
+    rm -rf "${SERVICES_DIR}/APLZ で圧縮.workflow"
+    rm -rf "${SERVICES_DIR}/APLZ で解凍.workflow"
+    /System/Library/CoreServices/pbs -flush 2>/dev/null || true
+    echo "==> Removed."
+    exit 0
+fi
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    sed -n '2,16p' "$0" | sed 's/^# \?//'
+    exit 0
+fi
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "[ERR] Finder services require macOS." >&2
+    exit 1
+fi
+
+find_asz() {
     local candidates=(
-        "/usr/local/bin/aplz"
-        "$HOME/.local/bin/aplz"
-        "$(cd "$(dirname "$0")" && pwd)/aplz"
+        "$HOME/.local/bin/asz"
+        "/usr/local/bin/asz"
+        "/opt/homebrew/bin/asz"
+        "$ROOT_DIR/build/asz"
     )
     for c in "${candidates[@]}"; do
         [[ -x "$c" ]] && echo "$c" && return
@@ -25,392 +52,692 @@ find_aplz() {
     echo ""
 }
 
-APLZ_PATH="$(find_aplz)"
-if [[ -z "$APLZ_PATH" ]]; then
-    echo "Error: aplz command not found." >&2
-    echo "Run install.sh first, then re-run this script." >&2
+ASZ_PATH="$(find_asz)"
+if [[ -z "$ASZ_PATH" ]]; then
+    echo "[ERR] asz command not found. Run ./install.sh first." >&2
     exit 1
 fi
 
-echo "==> Using aplz at: ${APLZ_PATH}"
+echo "==> Using asz: ${ASZ_PATH}"
 
-# ─── ワークフロー生成 ────────────────────────────────────────────────────────
-# 実績のある Automator Quick Action (servicesMenu) の document.wflow 形式で生成。
-# 「Run Shell Script」アクションで、入力をコマンド引数として受け取る。
+# ─── Automator Quick Action / Service ワークフロー生成 ──────────────────────────
 create_workflow() {
     local name="$1"
     local shell_script="$2"
-    local file_types="$3"  # NSSendFileTypes (plist XML fragment)
-    local wf_dir="${SERVICES_DIR}/${name}.workflow/Contents"
+    local wf_root="${SERVICES_DIR}/${name}.workflow"
+    local wf_dir="${wf_root}/Contents"
 
-    # 古いワークフローを完全に削除してから再作成
-    rm -rf "${SERVICES_DIR}/${name}.workflow"
+    rm -rf "$wf_root"
     mkdir -p "$wf_dir"
 
-    # Info.plist: macOS がサービスを認識するために必須
-    cat > "${wf_dir}/Info.plist" <<INFOPLIST
-<?xml version="1.0" encoding="UTF-8"?>
+    /usr/bin/python3 - "$name" "$wf_dir" "$shell_script" "$ASZ_PATH" <<'PYEOF'
+import os, sys, uuid
+from xml.sax.saxutils import escape
+
+name, wf_dir, script, asz_path = sys.argv[1:5]
+script = script.replace("__ASZ_FALLBACK__", asz_path)
+
+u1, u2, u3 = str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper()
+esc_name = escape(name, {'"': '&quot;'})
+esc_script = escape(script, {'"': '&quot;'})
+
+info_plist = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>NSServices</key>
-	<array>
-		<dict>
-			<key>NSMenuItem</key>
-			<dict>
-				<key>default</key>
-				<string>${name}</string>
-			</dict>
-			<key>NSMessage</key>
-			<string>runWorkflowAsService</string>
-			<key>NSRequiredContext</key>
-			<dict>
-				<key>NSApplicationIdentifier</key>
-				<string>com.apple.finder</string>
-			</dict>
-${file_types}
-		</dict>
-	</array>
+\t<key>NSServices</key>
+\t<array>
+\t\t<dict>
+\t\t\t<key>NSMenuItem</key>
+\t\t\t<dict>
+\t\t\t\t<key>default</key>
+\t\t\t\t<string>{esc_name}</string>
+\t\t\t</dict>
+\t\t\t<key>NSMessage</key>
+\t\t\t<string>runWorkflowAsService</string>
+\t\t\t<key>NSRequiredContext</key>
+\t\t\t<dict>
+\t\t\t\t<key>NSApplicationIdentifier</key>
+\t\t\t\t<string>com.apple.finder</string>
+\t\t\t</dict>
+\t\t\t<key>NSSendFileTypes</key>
+\t\t\t<array>
+\t\t\t\t<string>public.item</string>
+\t\t\t</array>
+\t\t</dict>
+\t</array>
 </dict>
 </plist>
-INFOPLIST
+'''
 
-    local uuid1 uuid2 uuid3
-    uuid1=$(uuidgen)
-    uuid2=$(uuidgen)
-    uuid3=$(uuidgen)
-
-    # shell_script 内の & < > " を XML エスケープ
-    local escaped_script
-    escaped_script=$(echo "$shell_script" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-
-    cat > "${wf_dir}/document.wflow" <<WFLOW
-<?xml version="1.0" encoding="UTF-8"?>
+doc_wflow = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>AMApplicationBuild</key>
-	<string>528</string>
-	<key>AMApplicationVersion</key>
-	<string>2.10</string>
-	<key>AMDocumentVersion</key>
-	<string>2</string>
-	<key>actions</key>
-	<array>
-		<dict>
-			<key>action</key>
-			<dict>
-				<key>AMAccepts</key>
-				<dict>
-					<key>Container</key>
-					<string>List</string>
-					<key>Optional</key>
-					<true/>
-					<key>Types</key>
-					<array>
-						<string>com.apple.cocoa.string</string>
-					</array>
-				</dict>
-				<key>AMActionVersion</key>
-				<string>2.0.3</string>
-				<key>AMApplication</key>
-				<array>
-					<string>Automator</string>
-				</array>
-				<key>AMParameterProperties</key>
-				<dict>
-					<key>COMMAND_STRING</key>
-					<dict/>
-					<key>CheckedForUserDefaultShell</key>
-					<dict/>
-					<key>inputMethod</key>
-					<dict/>
-					<key>shell</key>
-					<dict/>
-					<key>source</key>
-					<dict/>
-				</dict>
-				<key>AMProvides</key>
-				<dict>
-					<key>Container</key>
-					<string>List</string>
-					<key>Types</key>
-					<array>
-						<string>com.apple.cocoa.string</string>
-					</array>
-				</dict>
-				<key>ActionBundlePath</key>
-				<string>/System/Library/Automator/Run Shell Script.action</string>
-				<key>ActionName</key>
-				<string>シェルスクリプトを実行</string>
-				<key>ActionParameters</key>
-				<dict>
-					<key>COMMAND_STRING</key>
-					<string>${escaped_script}</string>
-					<key>CheckedForUserDefaultShell</key>
-					<true/>
-					<key>inputMethod</key>
-					<integer>1</integer>
-					<key>shell</key>
-					<string>/bin/bash</string>
-					<key>source</key>
-					<string></string>
-				</dict>
-				<key>BundleIdentifier</key>
-				<string>com.apple.RunShellScript</string>
-				<key>CFBundleVersion</key>
-				<string>2.0.3</string>
-				<key>CanShowSelectedItemsWhenRun</key>
-				<false/>
-				<key>CanShowWhenRun</key>
-				<true/>
-				<key>Category</key>
-				<array>
-					<string>AMCategoryUtilities</string>
-				</array>
-				<key>Class Name</key>
-				<string>RunShellScriptAction</string>
-				<key>InputUUID</key>
-				<string>${uuid1}</string>
-				<key>Keywords</key>
-				<array>
-					<string>Shell</string>
-					<string>Script</string>
-				</array>
-				<key>OutputUUID</key>
-				<string>${uuid2}</string>
-				<key>UUID</key>
-				<string>${uuid3}</string>
-				<key>UnlocalizedApplications</key>
-				<array>
-					<string>Automator</string>
-				</array>
-				<key>arguments</key>
-				<dict>
-					<key>0</key>
-					<dict>
-						<key>default value</key>
-						<string>for f in &quot;\$@&quot;; do echo &quot;\$f&quot;; done</string>
-						<key>name</key>
-						<string>COMMAND_STRING</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>0</string>
-					</dict>
-					<key>1</key>
-					<dict>
-						<key>default value</key>
-						<string>/bin/bash</string>
-						<key>name</key>
-						<string>shell</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>1</string>
-					</dict>
-					<key>2</key>
-					<dict>
-						<key>default value</key>
-						<integer>1</integer>
-						<key>name</key>
-						<string>inputMethod</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>2</string>
-					</dict>
-					<key>3</key>
-					<dict>
-						<key>default value</key>
-						<true/>
-						<key>name</key>
-						<string>CheckedForUserDefaultShell</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>3</string>
-					</dict>
-				</dict>
-				<key>conversionLabel</key>
-				<integer>0</integer>
-				<key>isViewVisible</key>
-				<integer>1</integer>
-				<key>location</key>
-				<string>301.500000:253.000000</string>
-				<key>nibPath</key>
-				<string>/System/Library/Automator/Run Shell Script.action/Contents/Resources/Base.lproj/main.nib</string>
-			</dict>
-			<key>isViewVisible</key>
-			<integer>1</integer>
-		</dict>
-	</array>
-	<key>connectors</key>
-	<dict/>
-	<key>workflowMetaData</key>
-	<dict>
-		<key>applicationBundleID</key>
-		<string>com.apple.finder</string>
-		<key>applicationBundleIDsByPath</key>
-		<dict>
-			<key>/System/Library/CoreServices/Finder.app</key>
-			<string>com.apple.finder</string>
-		</dict>
-		<key>applicationPath</key>
-		<string>/System/Library/CoreServices/Finder.app</string>
-		<key>applicationPaths</key>
-		<array>
-			<string>/System/Library/CoreServices/Finder.app</string>
-		</array>
-		<key>inputTypeIdentifier</key>
-		<string>com.apple.Automator.fileSystemObject</string>
-		<key>outputTypeIdentifier</key>
-		<string>com.apple.Automator.nothing</string>
-		<key>presentationMode</key>
-		<integer>15</integer>
-		<key>processesInput</key>
-		<false/>
-		<key>serviceApplicationBundleID</key>
-		<string>com.apple.finder</string>
-		<key>serviceApplicationPath</key>
-		<string>/System/Library/CoreServices/Finder.app</string>
-		<key>serviceInputTypeIdentifier</key>
-		<string>com.apple.Automator.fileSystemObject</string>
-		<key>serviceOutputTypeIdentifier</key>
-		<string>com.apple.Automator.nothing</string>
-		<key>serviceProcessesInput</key>
-		<false/>
-		<key>systemImageName</key>
-		<string>NSActionTemplate</string>
-		<key>useAutomaticInputType</key>
-		<false/>
-		<key>workflowTypeIdentifier</key>
-		<string>com.apple.Automator.servicesMenu</string>
-	</dict>
+\t<key>AMApplicationBuild</key>
+\t<string>528</string>
+\t<key>AMApplicationVersion</key>
+\t<string>2.10</string>
+\t<key>AMDocumentVersion</key>
+\t<string>2</string>
+\t<key>actions</key>
+\t<array>
+\t\t<dict>
+\t\t\t<key>action</key>
+\t\t\t<dict>
+\t\t\t\t<key>AMAccepts</key>
+\t\t\t\t<dict>
+\t\t\t\t\t<key>Container</key>
+\t\t\t\t\t<string>List</string>
+\t\t\t\t\t<key>Optional</key>
+\t\t\t\t\t<true/>
+\t\t\t\t\t<key>Types</key>
+\t\t\t\t\t<array>
+\t\t\t\t\t\t<string>com.apple.cocoa.string</string>
+\t\t\t\t\t</array>
+\t\t\t\t</dict>
+\t\t\t\t<key>AMActionVersion</key>
+\t\t\t\t<string>2.0.3</string>
+\t\t\t\t<key>AMApplication</key>
+\t\t\t\t<array>
+\t\t\t\t\t<string>Automator</string>
+\t\t\t\t</array>
+\t\t\t\t<key>AMParameterProperties</key>
+\t\t\t\t<dict>
+\t\t\t\t\t<key>COMMAND_STRING</key>
+\t\t\t\t\t<dict/>
+\t\t\t\t\t<key>CheckedForUserDefaultShell</key>
+\t\t\t\t\t<dict/>
+\t\t\t\t\t<key>inputMethod</key>
+\t\t\t\t\t<dict/>
+\t\t\t\t\t<key>shell</key>
+\t\t\t\t\t<dict/>
+\t\t\t\t\t<key>source</key>
+\t\t\t\t\t<dict/>
+\t\t\t\t</dict>
+\t\t\t\t<key>AMProvides</key>
+\t\t\t\t<dict>
+\t\t\t\t\t<key>Container</key>
+\t\t\t\t\t<string>List</string>
+\t\t\t\t\t<key>Types</key>
+\t\t\t\t\t<array>
+\t\t\t\t\t\t<string>com.apple.cocoa.string</string>
+\t\t\t\t\t</array>
+\t\t\t\t</dict>
+\t\t\t\t<key>ActionBundlePath</key>
+\t\t\t\t<string>/System/Library/Automator/Run Shell Script.action</string>
+\t\t\t\t<key>ActionName</key>
+\t\t\t\t<string>シェルスクリプトを実行</string>
+\t\t\t\t<key>ActionParameters</key>
+\t\t\t\t<dict>
+\t\t\t\t\t<key>COMMAND_STRING</key>
+\t\t\t\t\t<string>{esc_script}</string>
+\t\t\t\t\t<key>CheckedForUserDefaultShell</key>
+\t\t\t\t\t<true/>
+\t\t\t\t\t<key>inputMethod</key>
+\t\t\t\t\t<integer>1</integer>
+\t\t\t\t\t<key>shell</key>
+\t\t\t\t\t<string>/bin/bash</string>
+\t\t\t\t\t<key>source</key>
+\t\t\t\t\t<string></string>
+\t\t\t\t</dict>
+\t\t\t\t<key>BundleIdentifier</key>
+\t\t\t\t<string>com.apple.RunShellScript</string>
+\t\t\t\t<key>CFBundleVersion</key>
+\t\t\t\t<string>2.0.3</string>
+\t\t\t\t<key>CanShowSelectedItemsWhenRun</key>
+\t\t\t\t<false/>
+\t\t\t\t<key>CanShowWhenRun</key>
+\t\t\t\t<true/>
+\t\t\t\t<key>Category</key>
+\t\t\t\t<array>
+\t\t\t\t\t<string>AMCategoryUtilities</string>
+\t\t\t\t</array>
+\t\t\t\t<key>Class Name</key>
+\t\t\t\t<string>RunShellScriptAction</string>
+\t\t\t\t<key>InputUUID</key>
+\t\t\t\t<string>{u1}</string>
+\t\t\t\t<key>Keywords</key>
+\t\t\t\t<array>
+\t\t\t\t\t<string>Shell</string>
+\t\t\t\t\t<string>Script</string>
+\t\t\t\t</array>
+\t\t\t\t<key>OutputUUID</key>
+\t\t\t\t<string>{u2}</string>
+\t\t\t\t<key>UUID</key>
+\t\t\t\t<string>{u3}</string>
+\t\t\t\t<key>UnlocalizedApplications</key>
+\t\t\t\t<array>
+\t\t\t\t\t<string>Automator</string>
+\t\t\t\t</array>
+\t\t\t\t<key>arguments</key>
+\t\t\t\t<dict>
+\t\t\t\t\t<key>0</key>
+\t\t\t\t\t<dict>
+\t\t\t\t\t\t<key>default value</key>
+\t\t\t\t\t\t<string>for f in &quot;$@&quot;; do echo &quot;$f&quot;; done</string>
+\t\t\t\t\t\t<key>name</key>
+\t\t\t\t\t\t<string>COMMAND_STRING</string>
+\t\t\t\t\t\t<key>required</key>
+\t\t\t\t\t\t<string>0</string>
+\t\t\t\t\t\t<key>type</key>
+\t\t\t\t\t\t<string>0</string>
+\t\t\t\t\t\t<key>uuid</key>
+\t\t\t\t\t\t<string>0</string>
+\t\t\t\t\t</dict>
+\t\t\t\t\t<key>1</key>
+\t\t\t\t\t<dict>
+\t\t\t\t\t\t<key>default value</key>
+\t\t\t\t\t\t<string>/bin/bash</string>
+\t\t\t\t\t\t<key>name</key>
+\t\t\t\t\t\t<string>shell</string>
+\t\t\t\t\t\t<key>required</key>
+\t\t\t\t\t\t<string>0</string>
+\t\t\t\t\t\t<key>type</key>
+\t\t\t\t\t\t<string>0</string>
+\t\t\t\t\t\t<key>uuid</key>
+\t\t\t\t\t\t<string>1</string>
+\t\t\t\t\t</dict>
+\t\t\t\t\t<key>2</key>
+\t\t\t\t\t<dict>
+\t\t\t\t\t\t<key>default value</key>
+\t\t\t\t\t\t<integer>1</integer>
+\t\t\t\t\t\t<key>name</key>
+\t\t\t\t\t\t<string>inputMethod</string>
+\t\t\t\t\t\t<key>required</key>
+\t\t\t\t\t\t<string>0</string>
+\t\t\t\t\t\t<key>type</key>
+\t\t\t\t\t\t<string>0</string>
+\t\t\t\t\t\t<key>uuid</key>
+\t\t\t\t\t\t<string>2</string>
+\t\t\t\t\t</dict>
+\t\t\t\t\t<key>3</key>
+\t\t\t\t\t<dict>
+\t\t\t\t\t\t<key>default value</key>
+\t\t\t\t\t\t<true/>
+\t\t\t\t\t\t<key>name</key>
+\t\t\t\t\t\t<string>CheckedForUserDefaultShell</string>
+\t\t\t\t\t\t<key>required</key>
+\t\t\t\t\t\t<string>0</string>
+\t\t\t\t\t\t<key>type</key>
+\t\t\t\t\t\t<string>0</string>
+\t\t\t\t\t\t<key>uuid</key>
+\t\t\t\t\t\t<string>3</string>
+\t\t\t\t\t</dict>
+\t\t\t\t</dict>
+\t\t\t\t<key>conversionLabel</key>
+\t\t\t\t<integer>0</integer>
+\t\t\t\t<key>isViewVisible</key>
+\t\t\t\t<integer>1</integer>
+\t\t\t\t<key>location</key>
+\t\t\t\t<string>301.500000:253.000000</string>
+\t\t\t\t<key>nibPath</key>
+\t\t\t\t<string>/System/Library/Automator/Run Shell Script.action/Contents/Resources/Base.lproj/main.nib</string>
+\t\t\t</dict>
+\t\t\t<key>isViewVisible</key>
+\t\t\t<integer>1</integer>
+\t\t</dict>
+\t</array>
+\t<key>connectors</key>
+\t<dict/>
+\t<key>workflowMetaData</key>
+\t<dict>
+\t\t<key>applicationBundleID</key>
+\t\t<string>com.apple.finder</string>
+\t\t<key>applicationBundleIDsByPath</key>
+\t\t<dict>
+\t\t\t<key>/System/Library/CoreServices/Finder.app</key>
+\t\t\t<string>com.apple.finder</string>
+\t\t</dict>
+\t\t<key>applicationPath</key>
+\t\t<string>/System/Library/CoreServices/Finder.app</string>
+\t\t<key>applicationPaths</key>
+\t\t<array>
+\t\t\t<string>/System/Library/CoreServices/Finder.app</string>
+\t\t</array>
+\t\t<key>inputTypeIdentifier</key>
+\t\t<string>com.apple.Automator.fileSystemObject</string>
+\t\t<key>outputTypeIdentifier</key>
+\t\t<string>com.apple.Automator.nothing</string>
+\t\t<key>presentationMode</key>
+\t\t<integer>15</integer>
+\t\t<key>processesInput</key>
+\t\t<false/>
+\t\t<key>serviceApplicationBundleID</key>
+\t\t<string>com.apple.finder</string>
+\t\t<key>serviceApplicationPath</key>
+\t\t<string>/System/Library/CoreServices/Finder.app</string>
+\t\t<key>serviceInputTypeIdentifier</key>
+\t\t<string>com.apple.Automator.fileSystemObject</string>
+\t\t<key>serviceOutputTypeIdentifier</key>
+\t\t<string>com.apple.Automator.nothing</string>
+\t\t<key>serviceProcessesInput</key>
+\t\t<false/>
+\t\t<key>systemImageName</key>
+\t\t<string>NSActionTemplate</string>
+\t\t<key>useAutomaticInputType</key>
+\t\t<false/>
+\t\t<key>workflowTypeIdentifier</key>
+\t\t<string>com.apple.Automator.servicesMenu</string>
+\t</dict>
 </dict>
 </plist>
-WFLOW
+'''
+
+with open(os.path.join(wf_dir, "Info.plist"), "w", encoding="utf-8") as f:
+    f.write(info_plist)
+with open(os.path.join(wf_dir, "document.wflow"), "w", encoding="utf-8") as f:
+    f.write(doc_wflow)
+PYEOF
+
+    plutil -lint "${wf_dir}/Info.plist" >/dev/null
+    plutil -lint "${wf_dir}/document.wflow" >/dev/null
 }
-
-# ─── メイン処理 ──────────────────────────────────────────────────────────────
-
-if [[ "${1:-}" == "uninstall" ]]; then
-    echo "==> Removing Finder quick actions..."
-    rm -rf "${SERVICES_DIR}/APLZ で圧縮.workflow"
-    rm -rf "${SERVICES_DIR}/APLZ で解凍.workflow"
-    echo "Done. Quick actions removed."
-    exit 0
-fi
 
 mkdir -p "$SERVICES_DIR"
 
-# 圧縮アクション: 選択されたファイル/ディレクトリを aplz で圧縮
-COMPRESS_SCRIPT='export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
+# ─── 1. 圧縮ワークフロー用シェルスクリプト (APLZ-X .asz) ────────────────────────
+read -r -d '' COMPRESS_SCRIPT <<'EOF' || true
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+export LANG="ja_JP.UTF-8"
+export LC_CTYPE="UTF-8"
+
 exec >> /tmp/aplz_service.log 2>&1
-echo "=== $(date) ==="
-_cleanup_tmp=""
-trap "rm -rf \"$_cleanup_tmp\" 2>/dev/null" EXIT INT TERM
-for f in "$@"; do
-    base="$(basename "$f")"
-    dir="$(dirname "$f")"
-    tmp="/tmp/aplz_$$_${base}"
-    _cleanup_tmp="$tmp"
-    rc=0
-    echo "processing: $f"
-    if [ -d "$f" ]; then
-        # ディレクトリ: /tmp にコピー (Google Drive対応: -c でクローンせずバイトコピー)
-        mkdir -p "$tmp"
-        cp -R "$f"/. "$tmp" 2>/dev/null || true
-        '"${APLZ_PATH}"' compress "$tmp" "${dir}/${base}.tar.aplz"
-        rc=$?
-        rm -rf "$tmp"
-    else
-        cp "$f" "$tmp" 2>/dev/null || cat "$f" > "$tmp"
-        '"${APLZ_PATH}"' compress "$tmp"
-        rc=$?
-        if [ $rc -eq 0 ] && [ -f "${tmp}.aplz" ]; then
-            mv "${tmp}.aplz" "${dir}/${base}.aplz" 2>/dev/null || cp "${tmp}.aplz" "${dir}/${base}.aplz"
+echo "=== $(date) [compress] ==="
+
+ASZ_FALLBACK="__ASZ_FALLBACK__"
+
+notify() {
+    osascript \
+        -e 'on run argv' \
+        -e 'display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)' \
+        -e 'end run' \
+        -- "$1" "$2" "$3" >/dev/null 2>&1 || true
+}
+
+resolve_asz() {
+    local c
+    for c in "$HOME/.local/bin/asz" "/usr/local/bin/asz" "/opt/homebrew/bin/asz" "$ASZ_FALLBACK"; do
+        if [ -x "$c" ]; then
+            echo "$c"
+            return 0
         fi
-        rm -f "$tmp" "${tmp}.aplz"
+    done
+    return 1
+}
+
+unique_path() {
+    local dir="$1"
+    local name="$2"
+    local is_dir="$3"
+    local cand="${dir}/${name}"
+    if [ ! -e "$cand" ] && [ ! -L "$cand" ]; then
+        echo "$cand"
+        return 0
     fi
-    _cleanup_tmp=""
-    echo "exit code: $rc"
-    if [ $rc -eq 0 ]; then
-        osascript -e "display notification \"圧縮完了: ${base}\" with title \"APLZ\""
-    else
-        osascript -e "display notification \"圧縮失敗: ${base}\" with title \"APLZ\""
+    local stem="$name"
+    local ext=""
+    if [ "$is_dir" -eq 0 ]; then
+        local no_lead="${name#.}"
+        if [[ "$no_lead" == *.* ]]; then
+            stem="${name%.*}"
+            ext=".${name##*.}"
+        fi
     fi
-done'
+    local n=2
+    while :; do
+        cand="${dir}/${stem} ${n}${ext}"
+        if [ ! -e "$cand" ] && [ ! -L "$cand" ]; then
+            echo "$cand"
+            return 0
+        fi
+        n=$((n + 1))
+    done
+}
 
-# NSSendFileTypes: 圧縮は全ファイル/フォルダを対象
-COMPRESS_FILE_TYPES='			<key>NSSendFileTypes</key>
-			<array>
-				<string>public.item</string>
-			</array>'
+copy_with_retry() {
+    local src="$1"
+    local dst="$2"
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        cp -p "$src" "$dst" 2>/dev/null && return 0
+        ditto -- "$src" "$dst" 2>/dev/null && return 0
+        cat "$src" > "$dst" 2>/dev/null && return 0
+        rm -f "$dst"
+        sleep 1
+    done
+    return 1
+}
 
-echo "==> Creating: APLZ で圧縮.workflow"
-create_workflow "APLZ で圧縮" "$COMPRESS_SCRIPT" "$COMPRESS_FILE_TYPES"
+stage_tree() {
+    local src="$1"
+    local dst="$2"
+    local item rel item_target link_target
+    mkdir -p "$dst" || return 1
+    while IFS= read -r -d '' item; do
+        [ "$item" = "$src" ] && continue
+        rel="${item#$src/}"
+        item_target="${dst}/${rel}"
+        if [ -L "$item" ]; then
+            mkdir -p "$(dirname "$item_target")" || return 1
+            link_target="$(readlink "$item")" || return 1
+            ln -s "$link_target" "$item_target" || return 1
+        elif [ -d "$item" ]; then
+            mkdir -p "$item_target" || return 1
+        elif [ -f "$item" ]; then
+            mkdir -p "$(dirname "$item_target")" || return 1
+            copy_with_retry "$item" "$item_target" || return 1
+            chmod "$(stat -f %Lp "$item" 2>/dev/null)" "$item_target" 2>/dev/null || true
+        fi
+    done < <(find "$src" -print0)
+}
 
-# 解凍アクション: 選択された .aplz ファイルを解凍
-EXTRACT_SCRIPT='export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
-exec >> /tmp/aplz_service.log 2>&1
-echo "=== $(date) ==="
-_cleanup_tmp=""
-trap "rm -rf \"$_cleanup_tmp\" 2>/dev/null" EXIT INT TERM
-for f in "$@"; do
+ASZ_BIN="$(resolve_asz)" || {
+    echo "[ERR] asz binary not found"
+    notify "APLZ" "圧縮失敗" "asz コマンドが見つかりません"
+    exit 1
+}
+
+_active_work=""
+trap '[ -n "$_active_work" ] && rm -rf "$_active_work" 2>/dev/null' EXIT INT TERM
+
+total=$#
+index=0
+for raw_f in "$@"; do
+    index=$((index + 1))
+    f="$raw_f"
+    [ "$f" != "/" ] && f="${f%/}"
     base="$(basename "$f")"
     dir="$(dirname "$f")"
-    tmp="/tmp/aplz_$$_${base}"
-    _cleanup_tmp="$tmp"
-    echo "extracting: $f"
-    cp "$f" "$tmp" 2>/dev/null || cat "$f" > "$tmp"
-    out_base="${base%.aplz}"
-    out_base="${out_base%.tar}"
-    '"${APLZ_PATH}"' extract "$tmp" "/tmp"
-    rc=$?
-    echo "exit code: $rc"
-    if [ $rc -eq 0 ]; then
-        for out in /tmp/"$out_base" /tmp/"$out_base".tar; do
-            [ -e "$out" ] && mv "$out" "$dir/" 2>/dev/null && break
-        done
-        osascript -e "display notification \"解凍完了: ${base}\" with title \"APLZ\""
-    else
-        osascript -e "display notification \"解凍失敗: ${base}\" with title \"APLZ\""
+
+    if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+        echo "[ERR] Not found: $f"
+        notify "APLZ" "圧縮失敗" "${base} が見つかりません"
+        continue
     fi
-    rm -f "$tmp"
-    _cleanup_tmp=""
-done'
 
-# NSSendFileTypes: 解凍も全ファイルを対象 (.aplz 拡張子の UTI は未登録のため)
-EXTRACT_FILE_TYPES='			<key>NSSendFileTypes</key>
-			<array>
-				<string>public.item</string>
-			</array>'
+    echo "compressing [${index}/${total}]: $f"
+    notify "APLZ" "圧縮中 (${index}/${total})" "$base"
 
-echo "==> Creating: APLZ で解凍.workflow"
-create_workflow "APLZ で解凍" "$EXTRACT_SCRIPT" "$EXTRACT_FILE_TYPES"
+    work_root="$(mktemp -d "${dir}/.asz_work_XXXXXX" 2>/dev/null || mktemp -d /tmp/asz_work.XXXXXX)"
+    _active_work="$work_root"
+    tmp_out="${work_root}/${base}.asz"
+    log_out="${work_root}/asz.out"
+    rc=0
 
-# サービスキャッシュをリセット (変更を即座に反映)
+    # 高速ゼロコピー直圧縮を試行
+    if "$ASZ_BIN" c -3 -o "$tmp_out" "$f" > "$log_out" 2>&1; then
+        rc=0
+    else
+        cat "$log_out" 2>/dev/null || true
+        echo "direct compress failed, retrying via local staging (cloud drive fallback)..."
+        rm -f "$tmp_out"
+        staged="${work_root}/${base}"
+        if [ -d "$f" ] && [ ! -L "$f" ]; then
+            if stage_tree "$f" "$staged" && "$ASZ_BIN" c -3 -o "$tmp_out" "$staged" > "$log_out" 2>&1; then
+                rc=0
+            else
+                rc=$?
+            fi
+        else
+            if copy_with_retry "$f" "$staged" && "$ASZ_BIN" c -3 -o "$tmp_out" "$staged" > "$log_out" 2>&1; then
+                rc=0
+            else
+                rc=$?
+            fi
+        fi
+    fi
+
+    cat "$log_out" 2>/dev/null || true
+
+    if [ $rc -eq 0 ] && [ -f "$tmp_out" ]; then
+        target="$(unique_path "$dir" "${base}.asz" 0)"
+        if mv "$tmp_out" "$target" 2>/dev/null || (cp "$tmp_out" "$target" && rm -f "$tmp_out"); then
+            out_name="$(basename "$target")"
+            summary="$(awk -F'|' '/^[[:space:]]*Size[[:space:]]*:/ {s=$1; sub(/^[[:space:]]*Size[[:space:]]*:[[:space:]]*/, "", s); sub(/[[:space:]]*$/, "", s); print s; exit}' "$log_out" 2>/dev/null || true)"
+            echo "done: $target ($summary)"
+            if [ -n "$summary" ]; then
+                notify "APLZ" "圧縮完了 (${summary})" "$out_name"
+            else
+                notify "APLZ" "圧縮完了" "$out_name"
+            fi
+        else
+            rc=1
+            echo "[ERR] failed to move archive to: $target"
+            notify "APLZ" "圧縮失敗" "${base} の保存に失敗しました"
+        fi
+    else
+        echo "exit code: $rc"
+        notify "APLZ" "圧縮失敗" "${base}（ログ: /tmp/aplz_service.log）"
+    fi
+
+    rm -rf "$work_root"
+    _active_work=""
+done
+EOF
+
+# ─── 2. 解凍ワークフロー用シェルスクリプト (APLZ-X .asz 専用) ───────────────────
+read -r -d '' EXTRACT_SCRIPT <<'EOF' || true
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+export LANG="ja_JP.UTF-8"
+export LC_CTYPE="UTF-8"
+
+exec >> /tmp/aplz_service.log 2>&1
+echo "=== $(date) [decompress] ==="
+
+ASZ_FALLBACK="__ASZ_FALLBACK__"
+
+notify() {
+    osascript \
+        -e 'on run argv' \
+        -e 'display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)' \
+        -e 'end run' \
+        -- "$1" "$2" "$3" >/dev/null 2>&1 || true
+}
+
+resolve_asz() {
+    local c
+    for c in "$HOME/.local/bin/asz" "/usr/local/bin/asz" "/opt/homebrew/bin/asz" "$ASZ_FALLBACK"; do
+        if [ -x "$c" ]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+unique_path() {
+    local dir="$1"
+    local name="$2"
+    local is_dir="$3"
+    local cand="${dir}/${name}"
+    if [ ! -e "$cand" ] && [ ! -L "$cand" ]; then
+        echo "$cand"
+        return 0
+    fi
+    local stem="$name"
+    local ext=""
+    if [ "$is_dir" -eq 0 ]; then
+        local no_lead="${name#.}"
+        if [[ "$no_lead" == *.* ]]; then
+            stem="${name%.*}"
+            ext=".${name##*.}"
+        fi
+    fi
+    local n=2
+    while :; do
+        cand="${dir}/${stem} ${n}${ext}"
+        if [ ! -e "$cand" ] && [ ! -L "$cand" ]; then
+            echo "$cand"
+            return 0
+        fi
+        n=$((n + 1))
+    done
+}
+
+copy_with_retry() {
+    local src="$1"
+    local dst="$2"
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        cp -p "$src" "$dst" 2>/dev/null && return 0
+        ditto -- "$src" "$dst" 2>/dev/null && return 0
+        cat "$src" > "$dst" 2>/dev/null && return 0
+        rm -f "$dst"
+        sleep 1
+    done
+    return 1
+}
+
+read_magic4() {
+    LC_ALL=C dd if="$1" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \t\n'
+}
+
+EXTRACTED_DEST=""
+move_extracted_tree() {
+    local stage_dir="$1"
+    local target_dir="$2"
+    local fallback_name="$3"
+    EXTRACTED_DEST=""
+
+    local entries=()
+    shopt -s dotglob nullglob
+    entries=("$stage_dir"/*)
+    shopt -u dotglob nullglob
+
+    local count=${#entries[@]}
+    if [ "$count" -eq 0 ]; then
+        local dest="$(unique_path "$target_dir" "$fallback_name" 1)"
+        mkdir -p "$dest" || return 1
+        EXTRACTED_DEST="$dest"
+        return 0
+    elif [ "$count" -eq 1 ]; then
+        local item="${entries[0]}"
+        local item_name="$(basename "$item")"
+        local is_dir=0
+        [ -d "$item" ] && [ ! -L "$item" ] && is_dir=1
+        local dest="$(unique_path "$target_dir" "$item_name" "$is_dir")"
+        if mv "$item" "$dest" 2>/dev/null || (cp -a "$item" "$dest" && rm -rf "$item"); then
+            EXTRACTED_DEST="$dest"
+            return 0
+        fi
+        return 1
+    else
+        local dest="$(unique_path "$target_dir" "$fallback_name" 1)"
+        mkdir -p "$dest" || return 1
+        if mv "${entries[@]}" "$dest/" 2>/dev/null || (cp -a "${entries[@]}" "$dest/" && rm -rf "${entries[@]}"); then
+            EXTRACTED_DEST="$dest"
+            return 0
+        fi
+        return 1
+    fi
+}
+
+ASZ_BIN="$(resolve_asz)" || {
+    echo "[ERR] asz binary not found"
+    notify "APLZ" "解凍失敗" "asz コマンドが見つかりません"
+    exit 1
+}
+
+_active_work=""
+trap '[ -n "$_active_work" ] && rm -rf "$_active_work" 2>/dev/null' EXIT INT TERM
+
+total=$#
+index=0
+for raw_f in "$@"; do
+    index=$((index + 1))
+    f="$raw_f"
+    [ "$f" != "/" ] && f="${f%/}"
+    base="$(basename "$f")"
+    dir="$(dirname "$f")"
+
+    if [ ! -f "$f" ]; then
+        echo "[SKIP] Not a regular file: $f"
+        notify "APLZ" "解凍スキップ" "${base} はファイルではありません"
+        continue
+    fi
+
+    echo "extracting [${index}/${total}]: $f"
+    notify "APLZ" "解凍中 (${index}/${total})" "$base"
+
+    work_root="$(mktemp -d "${dir}/.asz_extract_XXXXXX" 2>/dev/null || mktemp -d /tmp/asz_extract.XXXXXX)"
+    _active_work="$work_root"
+    stage_dir="${work_root}/out"
+    mkdir -p "$stage_dir"
+
+    src_file="$f"
+    magic="$(read_magic4 "$src_file")"
+    if [ -z "$magic" ]; then
+        if copy_with_retry "$f" "${work_root}/${base}"; then
+            src_file="${work_root}/${base}"
+            magic="$(read_magic4 "$src_file")"
+        fi
+    fi
+
+    if [ "$magic" != "41535a01" ]; then
+        echo "[ERR] Not an .asz archive (magic=${magic:-none}): $f"
+        notify "APLZ" "非対応の形式" "${base} は .asz アーカイブではありません"
+        rm -rf "$work_root"
+        _active_work=""
+        continue
+    fi
+
+    rc=0
+    if "$ASZ_BIN" x "$src_file" -C "$stage_dir"; then
+        rc=0
+    elif [ "$src_file" = "$f" ]; then
+        echo "direct extract failed, retrying via local staging..."
+        rm -rf "$stage_dir" && mkdir -p "$stage_dir"
+        if copy_with_retry "$f" "${work_root}/${base}" && "$ASZ_BIN" x "${work_root}/${base}" -C "$stage_dir"; then
+            rc=0
+        else
+            rc=$?
+        fi
+    else
+        rc=1
+    fi
+
+    if [ $rc -eq 0 ]; then
+        fallback="${base%.asz}"
+        [ "$fallback" = "$base" ] && fallback="${base}_extracted"
+        if move_extracted_tree "$stage_dir" "$dir" "$fallback"; then
+            echo "done: $EXTRACTED_DEST"
+            notify "APLZ" "解凍完了" "$(basename "$EXTRACTED_DEST")"
+        else
+            echo "[ERR] failed to move extracted items to $dir"
+            notify "APLZ" "解凍失敗" "${base} の配置に失敗しました"
+        fi
+    else
+        echo "exit code: $rc"
+        notify "APLZ" "解凍失敗" "${base}（ログ: /tmp/aplz_service.log）"
+    fi
+
+    rm -rf "$work_root"
+    _active_work=""
+done
+EOF
+
+echo "==> Creating: ${SERVICES_DIR}/APLZ で圧縮.workflow"
+create_workflow "APLZ で圧縮" "$COMPRESS_SCRIPT"
+
+echo "==> Creating: ${SERVICES_DIR}/APLZ で解凍.workflow"
+create_workflow "APLZ で解凍" "$EXTRACT_SCRIPT"
+
+# macOS サービスキャッシュを更新
 /System/Library/CoreServices/pbs -flush 2>/dev/null || true
 
 echo ""
 echo "============================================================"
-echo " Finder クイックアクションをインストールしました"
+echo " Finder サービス / クイックアクションをインストールしました"
 echo ""
-echo " 使い方:"
-echo "   1. Finder でファイル/フォルダを右クリック"
-echo "   2.「クイックアクション」→「APLZ で圧縮」を選択"
-echo "   3. .aplz または .tar.aplz ファイルを右クリック"
-echo "   4.「クイックアクション」→「APLZ で解凍」を選択"
+echo " 登録されたサービス:"
+echo "   - APLZ で圧縮  → 選択したファイル／フォルダを .asz 圧縮"
+echo "   - APLZ で解凍  → 選択した .asz ファイルを解凍"
+echo ""
+echo " 動作仕様:"
+echo "   - 同名ファイル／フォルダがある場合は自動リネーム (例: foo 2.asz / foo 2)"
+echo "   - ログ出力先: /tmp/aplz_service.log"
 echo ""
 echo " アンインストール:"
-echo "   ./setup_finder.sh uninstall"
+echo "   ./setup_finder.sh --uninstall"
 echo "============================================================"

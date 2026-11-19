@@ -41,11 +41,16 @@ static std::string find_shader_dir() {
         if (stat((share + "/hetero_kernels.metallib").c_str(), &st) == 0) {
             return share;
         }
-        // 3) 開発ツリー (<repo>/aplz_x/phase3_asz/asz → ../phase2_hetero/)
-        std::string p2 = dir + "/../phase2_hetero";
-        if (stat((p2 + "/hetero_kernels.metallib").c_str(), &st) == 0 ||
-            stat((p2 + "/hetero_kernels.metal").c_str(), &st) == 0) {
-            return p2;
+        // 3) 開発ツリー (<repo>/build/asz → ../src/engine/ または <repo>/asz → src/engine/)
+        std::string dev1 = dir + "/../src/engine";
+        if (stat((dev1 + "/hetero_kernels.metallib").c_str(), &st) == 0 ||
+            stat((dev1 + "/hetero_kernels.metal").c_str(), &st) == 0) {
+            return dev1;
+        }
+        std::string dev2 = dir + "/src/engine";
+        if (stat((dev2 + "/hetero_kernels.metallib").c_str(), &st) == 0 ||
+            stat((dev2 + "/hetero_kernels.metal").c_str(), &st) == 0) {
+            return dev2;
         }
     }
     return ".";

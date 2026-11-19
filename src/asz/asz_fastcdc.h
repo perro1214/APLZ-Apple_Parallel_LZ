@@ -14,7 +14,7 @@
 #include <algorithm>
 #include <dispatch/dispatch.h>
 
-#include "../phase2_hetero/hetero_format.h"
+#include "../engine/hetero_format.h"
 
 // ─── FastCDC 定数 ──────────────────────────────────────────────────────────────
 static const uint32_t ASZ_CDC_MIN_SIZE    = 16384u;   // 16 KiB (先頭 16 KiB はハッシュスキップ)

@@ -22,7 +22,7 @@
 #include <string>
 #include <algorithm>
 
-#include "hetero_engine.h"
+#include "../src/engine/hetero_engine.h"
 
 // ─── 決定的 PRNG ──────────────────────────────────────────────────────────────
 static uint64_t g_rng = 0x123456789ABCDEF0ull;
@@ -75,9 +75,10 @@ static void gen_dataset(std::vector<uint8_t>& dst, size_t size, int kind, const 
     if (kind == 0) {
         // 0: Real Source + Docs + JSON (リポジトリの実ファイルを結合し、ページ単位で微変化)
         const char* files[] = {
-            "main.mm", "compression.metal", "README.md", "README.ja.md", "APLZ.h",
-            "aplz", "bench_compress.sh", "docs/aplz-g1-design.md",
-            "aplz_x/SPEC.md", "aplz_x/phase2_hetero/hetero_lz.h", "aplz_x/phase2_hetero/hetero_engine.h"
+            "README.md", "README.ja.md", "SPEC.md",
+            "src/rans/rans32.metal", "src/rans/rans32_cpu.h",
+            "src/engine/hetero_lz.h", "src/engine/hetero_engine.h", "src/engine/hetero_kernels.metal",
+            "src/asz/asz_archiver.h", "src/asz/asz_main.mm"
         };
         std::vector<uint8_t> corpus;
         for (const char* rel : files) {

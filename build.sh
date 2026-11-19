@@ -1,71 +1,58 @@
 #!/usr/bin/env bash
-# build.sh — GPU_ZIP Phase 1 & 2 build script
-# Usage: ./build.sh [clean]
+# build.sh — APLZ-X (.asz) 統合ビルド & テストスクリプト (macOS / Apple Silicon)
+#
+# 使い方:
+#   ./build.sh           # asz CLI + Metal カーネル + 全テスト／ベンチバイナリを build/ へビルド
+#   ./build.sh test      # ビルド後に自動検証スイートを実行
+#   ./build.sh clean     # build/ を削除
 set -euo pipefail
 
-TARGET="gpu_zip"
-SRC="main.mm"
-SHADER="compression.metal"
-AIR="${SHADER%.metal}.air"
-METALLIB="${SHADER%.metal}.metallib"
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="$ROOT_DIR/build"
 
-# ── Optional clean ────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "clean" ]]; then
-    echo "==> Cleaning build artifacts"
-    rm -f "${TARGET}" "${AIR}" "${METALLIB}"
+    rm -rf "$BUILD_DIR"
+    echo "==> Cleaned $BUILD_DIR"
     exit 0
 fi
 
-# ── Metal shader: compile (.metal → .air → .metallib) ────────────────────────
-# .metallib is pre-compiled for fastest load time at runtime,
-# but main.mm also supports source-level compilation as fallback.
-echo "==> Compiling Metal shader: ${SHADER}"
-xcrun -sdk macosx metal \
-    -std=metal3.0 \
-    -O2 \
-    -Wall \
-    -Wno-unused-variable \
-    -c "${SHADER}" \
-    -o "${AIR}"
+mkdir -p "$BUILD_DIR"
 
-xcrun -sdk macosx metallib \
-    "${AIR}" \
-    -o "${METALLIB}"
+echo "==> [1/4] Compiling Metal 3.0 shaders (rans32.metallib / hetero_kernels.metallib)..."
+xcrun -sdk macosx metal -std=metal3.0 -O3 -c "$ROOT_DIR/src/rans/rans32.metal" -o "$BUILD_DIR/rans32.air"
+xcrun -sdk macosx metallib "$BUILD_DIR/rans32.air" -o "$BUILD_DIR/rans32.metallib"
 
-echo "    -> ${METALLIB}"
+xcrun -sdk macosx metal -std=metal3.0 -O3 -c "$ROOT_DIR/src/engine/hetero_kernels.metal" -o "$BUILD_DIR/hetero_kernels.air"
+xcrun -sdk macosx metallib "$BUILD_DIR/hetero_kernels.air" -o "$BUILD_DIR/hetero_kernels.metallib"
 
-# ── Host code: Objective-C++ ──────────────────────────────────────────────────
-SDK=$(xcrun --sdk macosx --show-sdk-path)
-echo "==> Compiling host: ${SRC}  (SDK: ${SDK})"
-clang++ \
-    -std=c++17 \
-    -O2 \
-    -Wall \
-    -Wextra \
-    -Wno-unused-parameter \
-    -isysroot "${SDK}" \
-    -framework Metal \
-    -framework Foundation \
-    -framework QuartzCore \
-    -o "${TARGET}" \
-    "${SRC}"
+COMMON_FLAGS=(
+    -std=c++17 -O3 -flto -march=armv8.5-a+crc -Wall -Wextra
+    -fobjc-arc
+    -framework Foundation -framework Metal -framework QuartzCore
+)
 
-echo "    -> ${TARGET}"
-echo ""
+echo "==> [2/4] Building asz CLI..."
+clang++ "${COMMON_FLAGS[@]}" "$ROOT_DIR/src/asz/asz_main.mm" -o "$BUILD_DIR/asz"
 
-# ── Quick smoke test instructions ─────────────────────────────────────────────
-echo "============================================================"
-echo " Build complete!  Run with:"
-echo ""
-echo "   # Generate a random test file (10 MB)"
-echo "   dd if=/dev/urandom of=test_random.bin bs=1M count=10 2>/dev/null"
-echo ""
-echo "   # Compressible data (repeating pattern)"
-echo "   python3 -c \\"
-echo "     \"import sys; sys.stdout.buffer.write((b'hello world ' * 100000)[:10*1024*1024])\" \\"
-echo "     > test_text.bin"
-echo ""
-echo "   # Run"
-echo "   ./${TARGET} -c test_random.bin out.bin ${SHADER}"
-echo "   ./${TARGET} -c test_text.bin  out.bin ${SHADER}"
-echo "============================================================"
+echo "==> [3/4] Building test_phase3..."
+clang++ "${COMMON_FLAGS[@]}" "$ROOT_DIR/tests/test_phase3.mm" -o "$BUILD_DIR/test_phase3"
+
+echo "==> [4/4] Building benchmarks (bench_rans32, bench_phase2)..."
+clang++ "${COMMON_FLAGS[@]}" "$ROOT_DIR/tests/bench_rans32.mm" -o "$BUILD_DIR/bench_rans32"
+clang++ "${COMMON_FLAGS[@]}" "$ROOT_DIR/tests/bench_phase2.mm" -o "$BUILD_DIR/bench_phase2"
+
+echo "==> Build complete:"
+echo "    $BUILD_DIR/asz"
+echo "    $BUILD_DIR/hetero_kernels.metallib"
+echo "    $BUILD_DIR/test_phase3"
+echo "    $BUILD_DIR/bench_rans32"
+echo "    $BUILD_DIR/bench_phase2"
+
+if [[ "${1:-}" == "test" ]]; then
+    echo ""
+    echo "==> Running Phase 3 automated test suite..."
+    "$BUILD_DIR/test_phase3" "$BUILD_DIR"
+    echo ""
+    echo "==> Running CLI version & smoke check..."
+    "$BUILD_DIR/asz" --version
+fi

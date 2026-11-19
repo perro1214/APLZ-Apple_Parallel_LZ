@@ -31,7 +31,7 @@
 
 #include "asz_format.h"
 #include "asz_fastcdc.h"
-#include "../phase2_hetero/hetero_engine.h"
+#include "../engine/hetero_engine.h"
 
 struct AszCreateOptions {
     uint32_t level        = 3u;   // 1 (--fast) / 3 (--default) / 6 (--high)

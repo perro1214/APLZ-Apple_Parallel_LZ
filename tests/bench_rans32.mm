@@ -21,8 +21,8 @@
 #include <algorithm>
 #include <dispatch/dispatch.h>
 
-#include "rans32_format.h"
-#include "rans32_cpu.h"
+#include "../src/rans/rans32_format.h"
+#include "../src/rans/rans32_cpu.h"
 
 // ─── シェーダロード ───────────────────────────────────────────────────────────
 static id<MTLLibrary> load_rans32_library(id<MTLDevice> dev, const char* dir) {

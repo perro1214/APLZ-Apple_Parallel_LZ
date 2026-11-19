@@ -1,209 +1,115 @@
-# APLZ — Apple Parallel LZ
+# APLZ-X (`.asz`) — Apple Silicon UMA Heterogeneous Archiver
 
-**English** | [日本語](README.ja.md) | [中文](README.zh.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md)
+[日本語版 README はこちら](README.ja.md)
 
-A high-speed lossless compression/decompression engine running on Apple Silicon GPU. Combines Metal Compute Shaders (MSL 3.0) with tANS (Asymmetric Numeral Systems) in a fully GPU-accelerated pipeline, achieving **perfect round-trip** compression.
+**APLZ-X (`asz`)** is a lossless compressor and native archive format engineered from the ground up for **Apple Silicon (M1–M4+)** Unified Memory Architecture (UMA).
 
-## Highlights
+Instead of forcing sequential LZ parsing onto a GPU or wrapping directories in opaque `.tar` streams, APLZ-X coordinates **CPU P-cores + E-cores + Apple GPU** across a shared 3-slot asynchronous pipeline, combined with **FastCDC content-defined deduplication**, **type-aware Solid Grouping**, and **O(1) 256 KiB block-level random-access extraction**.
 
-- **Zero-copy I/O**: Leverages Apple Silicon's Unified Memory Architecture (UMA). `mmap` + `newBufferWithBytesNoCopy` eliminates CPU↔GPU input data copies
-- **Parallel LZ77**: 128 threads cooperatively process each 64 KB chunk using a 4-gram multiplicative hash (`h4`), 2-way hash table (`atomic_fetch_min`), Run-Skipping, 4-byte parallel match comparison, and parallel prefix-sum compaction
-- **GPU Per-chunk 128 Interleaved tANS**: Builds optimal tANS tables per chunk directly on the GPU (`build_tans_tables`). Each thread maintains an independent ANS state, encoding/decoding 128 bitstreams in parallel
-- **Fully Parallel LZ77 Decode**: Tile-based parallel prefix-scan for validation and literal writes, followed by unified modulo-indexed parallel copy across all 128 threads — including overlapping matches (`dist < len`), with no serial fallback
-- **Async Double Buffering**: GCD-based batch pipeline (`dispatch_semaphore` / `dispatch_group`). Overlaps GPU execution with CPU table prep and async file I/O
-- **O(1) Streaming Memory**: Fixed memory usage independent of input size. Processes in mega-batches (32 MB) for stable operation on 5 GB+ files
-- **Perfect Round-trip**: Guarantees byte-level exact match after compress → decompress, with GPU-side ANS/LZ stream validation
+---
 
-## Architecture
+## Key Features
 
-### Compression Pipeline (`-c`)
+- **Apple Silicon 32-way Symmetry**: 32-way SIMD-group Coalesced rANS maps 1:1 to Apple GPU's 32-wide SIMD-group and ARM64's 32×128-bit NEON register file (`uint32x4_t × 8`), producing **bit-identical archives** across GPU and CPU paths.
+- **Zero-Cold-Start Hybrid CPU/GPU Dispatch**:
+  - Small/medium one-shot CLI files (`< 96 MiB`): runs 100% on CPU NEON + 4-way ILP branchless 32-way rANS with **0 ms Metal startup overhead**.
+  - Large files (`>= 96 MiB`): warms up Metal asynchronously in the background while CPU processes initial batches, then seamlessly transitions to the **3-slot async pipeline (`CPU LZ+Xform || Apple GPU rANS || Parallel Pack + fwrite`)**.
+- **OpenZL-Style Per-Block Reversible Transforms**: Automatic per-block probe selects `SHUFFLE2` (FP16/BF16 AI weights with per-plane rANS + high-entropy plane RAW bypass), `SHUFFLE4` (FP32/Int32 telemetry & tensors), `ARM64_BCJ` (Apple Silicon Mach-O executables), or `RAW`/`RLE` bypass.
+- **Native `.asz` Container (No Temporary `.tar`)**:
+  - **Normalized FastCDC** (Gear Hash, 16–256 KiB chunks, 160-bit content fingerprint) deduplicates identical chunks across files, snapshots, and shifted versions.
+  - **Type-Aware Solid Grouping** packs small files (`< 64 KiB`) by data class (`TEXT` / `CODE` / `NUM` / `MEDIA` / `BIN`) sorted by extension for strong cross-file LZ compression while capping Solid Packs at 4 MiB.
+  - **O(1) Listing & 256 KiB Block Random-Access Extraction**: List any archive in milliseconds from its compressed EOF Central Directory, or extract a single file from a multi-GB archive by decoding only the 1–2 overlapping 256 KiB blocks.
+- **Triple-Layer Integrity & Security**: Hardware-accelerated ARM64 CRC32C with $\text{GF}(2)$ `crc32c_combine` verifies Header, Packs, 256 KiB Blocks, Chunks, and Files. Strict path sanitization blocks Zip-Slip and symlink-escape attacks.
 
-```
-mmap(input)  ← zero-copy MTLBuffer (Apple Silicon UMA)
-    |
-    v
-╔═══════════════════════════════════════════════════════════╗
-║  Mega-batch streaming loop (512 chunks = 32 MB / batch)   ║
-║  (Pass 1 double-buffered prefetch across mega-batches)    ║
-║                                                           ║
-║  1. GPU Pass 1: compress_chunk                            ║
-║     ┌───────────────────────────────────────────────────┐ ║
-║     │ 1 threadgroup (128 threads) = 1 chunk (64 KB)     │ ║
-║     │   A-1  Hash table init                            │ ║
-║     │   A-2  4-gram hash + Run-Skipping (atomic_min x2) │ ║
-║     │   A-3  LZ77 4-byte parallel match -> sparse[]     │ ║
-║     │   B    Parallel prefix-sum compaction -> compact[]│ ║
-║     └───────────────────────────────────────────────────┘ ║
-║                          |                                ║
-║                          v                                ║
-║  2. GPU Table Build: build_tans_tables                    ║
-║     Per chunk: Histogram -> Normalize -> Spread -> EncTbl ║
-║                          | SymInfo[512] + enc_table[1024] ║
-║                          v                                ║
-║  3. GPU Pass 2: tans_encode (double-buffered, 32 ch/batch)║
-║     128 interleaved ANS streams per chunk                 ║
-║     addCompletedHandler -> serial write queue (atomic tmp)║
-╚═══════════════════════════════════════════════════════════╝
-    | seek table backpatch + atomic rename
-    v
-  .aplz file
-```
+---
 
-### Decompression Pipeline (`-d`)
-
-```
-mmap(.aplz) -> parse header + validate chunk_offsets (seek table)
-    |
-    v
-╔═══════════════════════════════════════════════════════════╗
-║  Mega-batch streaming pipeline (double-buffered 32MB out) ║
-║  for each mega-batch:                                     ║
-║    ┌───────────────────────────────────────────────────┐  ║
-║    │ Double-buffered batch pipeline (32 chunks/batch)  │  ║
-║    │                                                   │  ║
-║    │ CPU (batch N+1, parallel via dispatch_apply):     │  ║
-║    │   read per-chunk compact_freq + 128 streams       │  ║
-║    │   build DecodeEntry[L] per chunk                  │  ║
-║    │                                                   │  ║
-║    │ GPU (batch N, 128 threads/chunk):                 │  ║
-║    │   tans_decode -> lz77_decode -> mb_out[slot]      │  ║
-║    └───────────────────────────────────────────────────┘  ║
-║    -> async fwrite(mb_out[slot]) -> reuse buffers         ║
-╚═══════════════════════════════════════════════════════════╝
-    v
-  restored original data
-```
-
-## File Format (.aplz)
-
-| Offset | Size | Content |
-|---|---|---|
-| 0 | 24 B | `FileHeader` (magic `"APLZ"`, `version = 3`, `original_size`, `chunk_size = 65536`, `num_chunks`) |
-| 24 | 4 B | `n_streams` = 128 |
-| 28 | 4 B | `ans_log_l` = 10 |
-| 32 | 8×N B | `chunk_offsets[N]` (seek table) |
-| ... | variable | Chunk data (N chunks, v3 format) |
-
-Per-chunk data layout (v3 format):
-- `token_cnt` (4 B): number of dense tokens
-- `compact_freq`: `n_nonzero` (2 B) + `[sym_id, freq]` pairs (4 B each) — non-zero symbols only
-- `stream_sizes[128]` (2 B each = 256 B): byte size of each ANS stream
-- stream data: concatenated ANS bitstreams (128 interleaved streams; each match token stores a 16-bit backward distance)
-
-> Empty files (`original_size = 0`, `num_chunks = 0`) are stored as a 32-byte header only (`FileHeader` + `n_streams` + `ans_log_l`).
-
-## Installation
-
-Requires macOS + Xcode Command Line Tools.
+## Installation (macOS / Apple Silicon)
 
 ```bash
-# Install to ~/.local/bin (optimized build with -O3 -flto + precompiled metallib)
+# Install to ~/.local/bin/asz (no sudo required)
 ./install.sh
 
-# Install to /usr/local/bin (requires sudo)
-./install.sh /usr/local
+# Or system-wide (/usr/local/bin/asz)
+./install.sh --system
 
-# Uninstall
-./install.sh uninstall
-```
-
-### Finder Integration (Optional)
-
-```bash
-# Add right-click → "Compress with APLZ" / "Extract with APLZ"
+# Register macOS Finder Quick Actions / Services ("APLZ で圧縮" / "APLZ で解凍")
 ./setup_finder.sh
 
-# Remove
-./setup_finder.sh uninstall
+# Uninstall
+./install.sh --uninstall
+./setup_finder.sh --uninstall
 ```
 
-Supports Google Drive and cloud storage files. The service automatically processes files via `/tmp` to work around macOS sandbox restrictions.
-
-## Usage
-
-### aplz command (recommended)
+### Build & Test from Source
 
 ```bash
-# Compress a file
-aplz compress myfile.txt              → myfile.txt.aplz
-
-# Compress a directory (auto tar)
-aplz compress myproject/              → myproject.tar.aplz
-
-# Extract
-aplz extract myfile.txt.aplz          → myfile.txt
-aplz extract myproject.tar.aplz       → myproject/
-
-# File info
-aplz info myfile.txt.aplz
+./build.sh test
 ```
 
-### gpu_zip (low-level API)
+---
+
+## CLI Usage
 
 ```bash
-./gpu_zip -c <input> <output.aplz> compression.metal [--debug]
-./gpu_zip -d <input.aplz> <output> compression.metal [--debug]
+# Create an archive from files and/or directories (-1 fast, -3 default, -6 high)
+asz c -3 -o backup.asz ./my_project
+asz c -1 --no-dedup -o fast.asz ./large_file.bin
+
+# List archive contents & dedup summary (O(1) footer read)
+asz l backup.asz
+
+# Verify full integrity without writing to disk
+asz t backup.asz
+
+# Extract entire archive
+asz x backup.asz -C ./restored
+
+# Extract a single file or subfolder via O(1) 256 KiB block random access
+asz x backup.asz -C ./restored my_project/src/main.cpp
+
+# Directly decompress a single-file archive
+asz d archive.asz restored.bin
 ```
 
-> If a precompiled `compression.metallib` exists next to `compression.metal`, `gpu_zip` loads it automatically and falls back to runtime source compilation otherwise.
+---
 
-### Development Build
+## Benchmarks (Apple M4, End-to-End File-to-File)
 
-```bash
-./build.sh        # -O2 build (generates gpu_zip + compression.metallib)
-./build.sh clean   # clean artifacts
-```
+All runs verified byte-for-byte with `cmp` / `dircmp`.
 
-## Performance (Apple M4)
+### 1. Realistic Mixed Directory (979 files, 90.6 MiB: 3-snapshot repo + FP16 weights + FP32 telemetry + Mach-O)
 
-Measured with `-O3 -flto` release build, best of 3 runs (512 MB inputs, verified byte-exact round-trip):
+| Tool | Archive Size | Ratio | Pack | Full Extract | List | 1-File Extract |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **`asz -1`** | **25.27 MB** | **26.6%** | **76.9 ms** | **262.4 ms** | **4.2 ms** | **4.73 ms** |
+| **`asz -3`** | **24.60 MB** | **25.9%** | **81.8 ms** | **217.7 ms** | **4.1 ms** | **8.94 ms** |
+| `tar+zstd -1 -T0` | 53.52 MB | 56.4% | 385.0 ms | 500.6 ms | 69.1 ms | 68.02 ms |
+| `tar+zstd -3 -T0` | 50.40 MB | 53.1% | 399.6 ms | 467.2 ms | 70.2 ms | 80.58 ms |
+| `tar+lz4 -1` | 69.78 MB | 73.5% | 426.3 ms | 407.5 ms | 49.7 ms | 49.46 ms |
 
-### Compression
+### 2. Large Single File — 1.00 GiB Heterogeneous (`FP32 + FP16 + Mach-O + Mixed`)
 
-| Data | Input | Output | Ratio | Throughput |
-|---|---|---|---|---|
-| Text (repeating pattern) | 512 MB | 10.3 MB | 2.0% | 297 MB/s |
-| Random binary | 512 MB | 535.9 MB | 104.7% | 134 MB/s |
+| Tool | Ratio | Archive Size | Compress | Decompress | Verify / List |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| **`asz -3`** | **37.58%** | **384.8 MiB** | **2,949 MB/s (0.35 s)** | **2,398 MB/s (0.43 s)** | Verify `0.39 s` / List `7.1 ms` |
+| `zstd -3 -T0` | 66.19% | 677.8 MiB | 2,248 MB/s (0.46 s) | 1,183 MB/s (0.87 s) | — |
 
-### Decompression
+### 3. Single Files — 256 MiB (`asz` vs `zstd -3 -T0` vs `lz4 -1`)
 
-| Data | Input | Speed | Notes |
-|---|---|---|---|
-| Text (repeating pattern) | 512 MB | 2.6 GB/s | 16 mega-batches, full pipeline overlap |
-| Random binary | 512 MB | 232 MB/s | 16 mega-batches, mostly literals |
+| Dataset | `asz -1` (Ratio / Comp / Dec) | `asz -3` (Ratio / Comp / Dec) | `zstd -3 -T0` (Ratio / Comp / Dec) | `lz4 -1` (Ratio / Comp / Dec) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Source+Docs** | **3.4%** / 3,722 / 3,689 MB/s | **3.2%** / 3,318 / **4,032 MB/s** | 0.2% / 9,140 / 5,482 MB/s | 36.6% / 1,082 / 1,654 MB/s |
+| **FP16 Weights** | **84.1%** / 2,096 / **3,372 MB/s** | **84.1%** / 2,035 / **2,442 MB/s** | 91.6% / 3,268 / 1,195 MB/s | 100.0% / 2,565 / 1,915 MB/s |
+| **FP32 Telemetry** | **41.0%** / **2,156** / **4,135 MB/s** | **38.3%** / **1,771** / **3,539 MB/s** | 75.5% / 1,279 / 1,008 MB/s | 99.9% / 1,551 / 1,608 MB/s |
+| **Mixed Real** | **48.6%** / **2,410** / **3,238 MB/s** | **48.5%** / **2,363** / **3,190 MB/s** | 57.9% / 1,853 / 1,589 MB/s | 73.5% / 1,016 / 1,098 MB/s |
 
-> Random data is incompressible so output slightly exceeds input (tANS/distance field overhead).
-> Memory usage is constant regardless of input size thanks to mega-batch streaming.
+---
 
-## Source Files
+## Project Layout
 
-| File | Role |
-|---|---|
-| `APLZ.h` | Shared header (structs & constants for CPU and GPU) |
-| `compression.metal` | GPU kernels (MSL 3.0): `compress_chunk`, `build_tans_tables`, `tans_encode`, `tans_decode`, `lz77_decode` |
-| `main.mm` | Host driver (Objective-C++): O(1) streaming mega-batch + async double-buffered pipelines |
-| `aplz` | User-facing CLI wrapper (Bash): file/directory support, tar integration |
-| `install.sh` | Installer: optimized build (`-O3 -flto` + `.metallib`) + system-wide deployment |
-| `setup_finder.sh` | macOS Finder Quick Action generator (right-click compress/extract) |
-| `build.sh` | Development build script |
-| `bench_compress.sh` | Benchmark script comparing APLZ against gzip/zip/zstd/lz4/xz |
-
-## Technical Details
-
-- **LZ77**: 4-gram multiplicative hash (`h4`), 2-way hash table (`atomic_fetch_min`) with Run-Skipping, 4-byte parallel match comparison, parallel prefix-sum compaction (`sparse` → `compact`), max match 255, min match 3, distance up to 65534
-- **Per-chunk tANS (v3)**: Dynamically builds optimal tANS tables per 64 KB chunk on the GPU (`build_tans_tables`). 128 interleaved ANS streams, 512 symbols (256 literals + 256 match lengths), L=1024, Duda's fast spread, and threadgroup cooperative loading on GPU
-- **ANS Encoding**: Forward encode with renormalization, 16-bit match distance fields, sentinel bit for bitstream end detection
-- **ANS Decoding**: Reverse playback from final state, sentinel via `clz()`, word-level batch bit extraction, O(1) decode table lookup, and per-chunk stream/state bounds validation
-- **Compact Frequency Serialization**: Stores only non-zero entries per chunk (`n_nonzero + [sym_id, freq]` pairs), minimizing file size overhead
-- **Fully Parallel LZ77 Decode**: Tile-based parallel prefix-scan for validation and literal writes, followed by unified modulo-indexed parallel copy (`out[off - dist + (j % dist)]`) handling both overlapping and non-overlapping matches without a serial fallback
-- **Async Double Buffering**: GCD-based batch pipeline (32 chunks/batch, 2 slots). `dispatch_semaphore` for slot exclusion, `dispatch_apply` for parallel CPU decode-table build, `addCompletedHandler` + serial `dispatch_queue` for ordered async writes, and atomic temp-file rename on compression
-- **O(1) Streaming Memory**: Mega-batch architecture (512 chunks = 32 MB per batch). Buffers are reused across mega-batches for constant memory usage regardless of input size
-
-## Known Limitations
-
-- **BS_CAP = 1024 B**: 1 stream max output is 1024 bytes. Highly incompressible data with extreme expansion may truncate bits.
-- **Chunk size fixed at 64 KB**: Tunable in `APLZ.h` / `compression.metal` but requires rebuild.
-
-## License
-
-MIT License. See [LICENSE](LICENSE) for details.
+- [SPEC.md](SPEC.md) — Full mathematical & binary format specification
+- [src/rans/](src/rans/) — 32-way Coalesced rANS core (Metal GPU + ARM64 NEON + Scalar reference)
+- [src/engine/](src/engine/) — 3-slot UMA heterogeneous block engine (`ASZ2`: LZ + NEON transforms + GPU/CPU rANS + `decompress_range`)
+- [src/asz/](src/asz/) — `.asz` native container, FastCDC deduplication, Solid Grouping, and `asz` CLI
+- [tests/](tests/) — Automated verification suite and Phase 1 / Phase 2 benchmarks
+- [build.sh](build.sh) / [install.sh](install.sh) / [setup_finder.sh](setup_finder.sh) — Build, install, and macOS Finder Services scripts

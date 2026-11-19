@@ -8,7 +8,7 @@
 #include <vector>
 #include <string>
 
-#include "asz_archiver.h"
+#include "../src/asz/asz_archiver.h"
 
 static uint64_t g_rng = 0x123456789ABCDEF0ULL;
 static inline uint64_t next_rng() {

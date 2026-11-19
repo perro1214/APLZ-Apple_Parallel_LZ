@@ -1,210 +1,115 @@
-# APLZ — Apple Parallel LZ
+# APLZ-X (`.asz`) — Apple Silicon UMA 異種協調アーカイバ
 
-[English](README.md) | **日本語** | [中文](README.zh.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md)
+[English README](README.md)
 
-Apple Silicon GPU で動作する高速ロスレス圧縮/解凍エンジン。Metal Compute Shader (MSL 3.0) と tANS (Asymmetric Numeral Systems) を組み合わせた GPU パイプラインにより、圧縮・解凍の完全な Round-trip を実現する。
+**APLZ-X（`asz`）** は、Apple Silicon（M1〜M4+）のユニファイドメモリアーキテクチャ（UMA）とハードウェア構造から逆算して設計した、次世代ロスレス圧縮・ネイティブアーカイブツールです。
 
-## 主な特徴
+CPU の P-core・E-core と Apple GPU を 3 スロット完全非同期パイプラインで協調動作させ、さらに **FastCDC 内容定義チャンク重複排除**、**型別 Solid Grouping**、**256 KiB ブロック単位の O(1) 部分ランダムアクセス展開** を単一バイナリフォーマット `.asz` に統合しています。
 
-- Zero-copy I/O: Apple Silicon の Unified Memory Architecture (UMA) を使い、`mmap` + `newBufferWithBytesNoCopy` により CPU↔GPU 間の入力データコピーを排除する。
-- 並列 LZ77: 128 スレッドが 64 KB チャンクを協調して処理する。4-gram 乗算ハッシュ (`h4`)、2-way ハッシュ (`atomic_fetch_min`)、Run-Skipping、4 バイト並列比較で高速にマッチを探索し、parallel prefix-sum でコンパクションする。
-- GPU Per-chunk 128 Interleaved tANS: チャンクごとの最適な tANS テーブルを GPU (`build_tans_tables`) で動的に構築する。各スレッドが独立した ANS 状態を保持し、128 本のビットストリームを並列にエンコード/デコードする。
-- 完全並列 LZ77 デコード: タイル単位の parallel prefix-scan でバリデーションとリテラル書き込みを進め、重複マッチ (`dist < len`) もシリアルフォールバックなしでモジュロ演算により 128 スレッドで並列コピーする。
-- 非同期ダブルバッファリング: GCD (`dispatch_semaphore` / `dispatch_group`) によるバッチパイプラインで、GPU 実行と CPU テーブル構築・非同期ファイル I/O をオーバーラップさせる。
-- O(1) ストリーミング・メモリ: 入力サイズに依存しない固定のメモリ使用量で動作する。メガバッチ (32 MB) 単位で処理し、5 GB+ のファイルでも安定して動作する。
-- Perfect Round-trip: 圧縮と解凍でバイトレベルの完全一致を保証する。GPU 側で ANS/LZ ストリームのバリデーションも備える。
+---
 
-## アーキテクチャ
+## 主な特長
 
-### 圧縮パイプライン (`-c`)
+- **Apple Silicon「32-way 対称性」**: Apple GPU の SIMD-group 幅（32）と ARM64 NEON の 128-bit レジスタ群（32 本、`uint32x4_t × 8`）に 1:1 対応する **32-way Coalesced rANS** を採用。GPU と CPU で **1 ビット残らず完全一致** する出力を生成します。
+- **Zero-Cold-Start Hybrid CPU/GPU 制御**:
+  - 小〜中ファイル（`< 96 MiB`）: Metal 起動コストを避け、ARM64 NEON＋4 レーン ILP ブランチレス 32-way rANS で起動遅延 0 ms のまま完走。
+  - 大ファイル（`>= 96 MiB`）: 先頭バッチを CPU で即時処理しつつ裏側で Metal を非同期初期化し、完了次第 **3 スロット並列パイプライン（CPU LZ+前処理 || Apple GPU rANS || 並列パッキング＋fwrite）** へ自動移行。
+- **OpenZL 型ブロック別可逆前処理**: 256 KiB ブロックごとに高速プローブを行い、`SHUFFLE2`（FP16/BF16 AI 重み・プレーン別 rANS＋高エントロピー仮数部 RAW バイパス）、`SHUFFLE4`（FP32/Int32 数値・科学技術データ）、`ARM64_BCJ`（Apple Silicon Mach-O 実行バイナリ）、`RAW`/`RLE` を自動選択。
+- **一時 `.tar` 廃止の `.asz` ネイティブコンテナ**:
+  - **正規化 FastCDC**（Gear Hash, 16〜256 KiB, 160-bit 強指紋）により、ファイル間・世代バックアップ間・先頭バイト挿入シフト後でも重複チャンクを自動排除。
+  - **型別 Solid Grouping** により、64 KiB 未満の小ファイルをデータ種別（`TEXT`/`CODE`/`NUM`/`MEDIA`/`BIN`）かつ拡張子順で 4 MiB 上限の Solid Pack へ集約。
+  - **O(1) 一覧表示＆部分展開**: 末尾の圧縮セントラルディレクトリを読むだけで数 ms で一覧表示し、巨大アーカイブから 1 ファイルだけ取り出す場合も該当する 256 KiB ブロックのみを選択復号します。
+- **3 重整合性検証と安全性**: ARM64 ハードウェア CRC32C と $\text{GF}(2)$ 結合により Header・Pack・256 KiB Block・Chunk・File を全層検証。Zip-Slip およびシンボリックリンク経由のディレクトリ逸脱を厳格に拒否します。
 
-```
-mmap(input)  <- zero-copy MTLBuffer (Apple Silicon UMA)
-    |
-    v
-╔═══════════════════════════════════════════════════════════╗
-║  メガバッチ・ストリーミング (512 chunks = 32 MB / batch)   ║
-║  (Pass 1 はメガバッチ間でダブルバッファ事前プリフェッチ)    ║
-║                                                           ║
-║  1. GPU Pass 1: compress_chunk                            ║
-║     ┌───────────────────────────────────────────────────┐ ║
-║     │ 1 threadgroup (128 threads) = 1 chunk (64 KB)     │ ║
-║     │   A-1  Hash table init                            │ ║
-║     │   A-2  4-gram hash + Run-Skipping (atomic_min x2) │ ║
-║     │   A-3  LZ77 4-byte parallel match -> sparse[]     │ ║
-║     │   B    Parallel prefix-sum compaction -> compact[]│ ║
-║     └───────────────────────────────────────────────────┘ ║
-║                          |                                ║
-║                          v                                ║
-║  2. GPU テーブル構築: build_tans_tables                    ║
-║     Per chunk: Histogram -> Normalize -> Spread -> EncTbl ║
-║                          | SymInfo[512] + enc_table[1024] ║
-║                          v                                ║
-║  3. GPU Pass 2: tans_encode (ダブルバッファ, 32 ch/batch)  ║
-║     チャンクあたり 128 本のインターリーブ ANS ストリーム    ║
-║     addCompletedHandler -> serial write queue (tmp 書出)  ║
-╚═══════════════════════════════════════════════════════════╝
-    | シークテーブル書き戻し + アトミック rename
-    v
-  .aplz file
-```
+---
 
-### 解凍パイプライン (`-d`)
-
-```
-mmap(.aplz) -> ヘッダ解析 + chunk_offsets バリデーション
-    |
-    v
-╔═══════════════════════════════════════════════════════════╗
-║  メガバッチ・ストリーミング (ダブルバッファ 32 MB 出力)     ║
-║  for each mega-batch:                                     ║
-║    ┌───────────────────────────────────────────────────┐  ║
-║    │ ダブルバッファ・バッチパイプライン (32 chunks/batch)│  ║
-║    │                                                   │  ║
-║    │ CPU (batch N+1, dispatch_apply で並列構築):        │  ║
-║    │   per-chunk compact_freq + 128 streams 読み込み    │  ║
-║    │   DecodeEntry[L] をチャンクごとに構築              │  ║
-║    │                                                   │  ║
-║    │ GPU (batch N, 128 threads/chunk):                 │  ║
-║    │   tans_decode -> lz77_decode -> mb_out[slot]      │  ║
-║    └───────────────────────────────────────────────────┘  ║
-║    -> 非同期 fwrite(mb_out[slot]) -> バッファ再利用        ║
-╚═══════════════════════════════════════════════════════════╝
-    v
-  復元データ
-```
-
-## ファイルフォーマット (.aplz)
-
-| Offset | Size | Content |
-|---|---|---|
-| 0 | 24 B | `FileHeader` (magic `"APLZ"`, `version = 3`, `original_size`, `chunk_size = 65536`, `num_chunks`) |
-| 24 | 4 B | `n_streams` = 128 |
-| 28 | 4 B | `ans_log_l` = 10 |
-| 32 | 8×N B | `chunk_offsets[N]` (seek table) |
-| ... | variable | Chunk data (N チャンク、v3 形式) |
-
-各チャンクのデータ構造 (v3 形式) は次のとおり。
-
-- `token_cnt` (4 B): dense token 数
-- `compact_freq`: `n_nonzero` (2 B) + `[sym_id, freq]` ペア (各 4 B、非ゼロシンボルのみ)
-- `stream_sizes[128]` (各 2 B = 256 B): 各 ANS ストリームのバイトサイズ
-- stream data: 連結された ANS ビットストリーム (128 インターリーブストリーム、各マッチトークンは 16-bit 後方距離を含む)
-
-> 空ファイル (`original_size = 0`, `num_chunks = 0`) は 32 バイトのヘッダのみ (`FileHeader` + `n_streams` + `ans_log_l`) で保存される。
-
-## インストール
-
-macOS + Xcode Command Line Tools が必要。
+## インストール（macOS / Apple Silicon）
 
 ```bash
-# ~/.local/bin にインストール (-O3 -flto 最適化ビルド + 事前コンパイル metallib)
+# ~/.local/bin/asz へインストール（sudo 不要）
 ./install.sh
 
-# /usr/local/bin にインストール (sudo 必要)
-./install.sh /usr/local
+# システム全体（/usr/local/bin/asz）へインストールする場合
+./install.sh --system
 
-# アンインストール
-./install.sh uninstall
-```
-
-### Finder 統合 (オプション)
-
-```bash
-# 右クリック ->「APLZ で圧縮」「APLZ で解凍」を追加
+# macOS Finder「サービス / クイックアクション」登録（APLZ で圧縮 / APLZ で解凍）
 ./setup_finder.sh
 
-# 削除
-./setup_finder.sh uninstall
+# アンインストール
+./install.sh --uninstall
+./setup_finder.sh --uninstall
 ```
 
-Google Drive やクラウドストレージ上のファイルにも対応する。サービス実行時は自動的に `/tmp` 経由で処理することで、macOS サンドボックス制限を回避する。
-
-## 使い方
-
-### aplz コマンド (推奨)
+### ソースからのビルド & 自動テスト
 
 ```bash
-# ファイル圧縮
-aplz compress myfile.txt              → myfile.txt.aplz
-
-# ディレクトリ圧縮 (自動 tar)
-aplz compress myproject/              → myproject.tar.aplz
-
-# 解凍
-aplz extract myfile.txt.aplz          → myfile.txt
-aplz extract myproject.tar.aplz       → myproject/
-
-# ファイル情報
-aplz info myfile.txt.aplz
+./build.sh test
 ```
 
-### gpu_zip (低レベル API)
+---
+
+## CLI の使い方
 
 ```bash
-./gpu_zip -c <input> <output.aplz> compression.metal [--debug]
-./gpu_zip -d <input.aplz> <output> compression.metal [--debug]
+# ファイルやディレクトリを .asz へ圧縮 (-1 高速 / -3 標準 / -6 高圧縮)
+asz c -3 -o backup.asz ./my_project
+asz c -1 --no-dedup -o fast.asz ./large_file.bin
+
+# アーカイブ内容と重複排除サマリを O(1) で一覧表示
+asz l backup.asz
+
+# ディスクへ書き出さずに全層 CRC32C 整合性を検証
+asz t backup.asz
+
+# アーカイブ全体を展開
+asz x backup.asz -C ./restored
+
+# 特定ファイル / サブフォルダのみを O(1) ブロック部分展開
+asz x backup.asz -C ./restored my_project/src/main.cpp
+
+# 単一ファイルアーカイブを直接解凍
+asz d archive.asz restored.bin
 ```
 
-> `compression.metal` と同じ場所に事前コンパイル済みの `compression.metallib` がある場合は自動でロードし、存在しない場合は実行時にソースコンパイルへフォールバックする。
+---
 
-### 開発用ビルド
+## 実測ベンチマーク（Apple M4, End-to-End ファイル対ファイル）
 
-```bash
-./build.sh        # -O2 ビルド (gpu_zip + compression.metallib を生成)
-./build.sh clean   # 成果物削除
-```
+すべて `cmp` / `dircmp` によるバイト完全一致を確認済みです。
 
-## パフォーマンス (Apple M4)
+### 1. 実プロジェクトディレクトリ（979 ファイル / 90.6 MiB：3 世代ソース＋FP16 重み 2 世代＋FP32 テレメトリ＋Mach-O）
 
-`-O3 -flto` リリースビルドで 512 MB の入力を 3 回実行したベスト値（バイト完全一致の Round-trip を検証済み）。
+| ツール | 圧縮後サイズ | 圧縮率 | 圧縮 | 全展開 | 一覧 (`l`/`-t`) | 1 ファイル部分展開 |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **`asz -1`** | **25.27 MB** | **26.6%** | **76.9 ms** | **262.4 ms** | **4.2 ms** | **4.73 ms** |
+| **`asz -3`** | **24.60 MB** | **25.9%** | **81.8 ms** | **217.7 ms** | **4.1 ms** | **8.94 ms** |
+| `tar+zstd -1 -T0` | 53.52 MB | 56.4% | 385.0 ms | 500.6 ms | 69.1 ms | 68.02 ms |
+| `tar+zstd -3 -T0` | 50.40 MB | 53.1% | 399.6 ms | 467.2 ms | 70.2 ms | 80.58 ms |
+| `tar+lz4 -1` | 69.78 MB | 73.5% | 426.3 ms | 407.5 ms | 49.7 ms | 49.46 ms |
 
-### 圧縮
+### 2. 大容量単一ファイル — 1.00 GiB 混在データ（`FP32 + FP16 + Mach-O + Mixed`）
 
-| データ | 入力 | 出力 | 圧縮率 | スループット |
-|---|---|---|---|---|
-| テキスト (繰り返しパターン) | 512 MB | 10.3 MB | 2.0% | 297 MB/s |
-| ランダムバイナリ | 512 MB | 535.9 MB | 104.7% | 134 MB/s |
+| ツール | 圧縮率 | 出力サイズ | 圧縮速度 | 解凍速度 | 検証 / 一覧 |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| **`asz -3`** | **37.58%** | **384.8 MiB** | **2,949 MB/s (0.35 秒)** | **2,398 MB/s (0.43 秒)** | 整合性検証 `0.39 秒` / 一覧 `7.1 ms` |
+| `zstd -3 -T0` | 66.19% | 677.8 MiB | 2,248 MB/s (0.46 秒) | 1,183 MB/s (0.87 秒) | — |
 
-### 解凍
+### 3. 単一ファイル — 256 MiB（`asz` vs `zstd -3 -T0` vs `lz4 -1`）
 
-| データ | 入力 | 速度 | 備考 |
-|---|---|---|---|
-| テキスト (繰り返しパターン) | 512 MB | 2.6 GB/s | 16 mega-batches、フルパイプラインオーバーラップ |
-| ランダムバイナリ | 512 MB | 232 MB/s | 16 mega-batches、ほぼリテラル |
+| データセット | `asz -1` (圧縮率 / 圧縮 / 解凍) | `asz -3` (圧縮率 / 圧縮 / 解凍) | `zstd -3 -T0` (圧縮率 / 圧縮 / 解凍) | `lz4 -1` (圧縮率 / 圧縮 / 解凍) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Source+Docs** | **3.4%** / 3,722 / 3,689 MB/s | **3.2%** / 3,318 / **4,032 MB/s** | 0.2% / 9,140 / 5,482 MB/s | 36.6% / 1,082 / 1,654 MB/s |
+| **FP16 Weights** | **84.1%** / 2,096 / **3,372 MB/s** | **84.1%** / 2,035 / **2,442 MB/s** | 91.6% / 3,268 / 1,195 MB/s | 100.0% / 2,565 / 1,915 MB/s |
+| **FP32 Telemetry** | **41.0%** / **2,156** / **4,135 MB/s** | **38.3%** / **1,771** / **3,539 MB/s** | 75.5% / 1,279 / 1,008 MB/s | 99.9% / 1,551 / 1,608 MB/s |
+| **Mixed Real** | **48.6%** / **2,410** / **3,238 MB/s** | **48.5%** / **2,363** / **3,190 MB/s** | 57.9% / 1,853 / 1,589 MB/s | 73.5% / 1,016 / 1,098 MB/s |
 
-> ランダムデータは非圧縮のため、tANS や distance フィールドのオーバーヘッドにより出力が入力をわずかに超える。
-> メガバッチストリーミングにより、入力サイズに関係なくメモリ使用量は一定。
+---
 
-## ソースファイル構成
+## ディレクトリ構成
 
-| ファイル | 役割 |
-|---|---|
-| `APLZ.h` | 共有ヘッダ (CPU/GPU 共通の構造体・定数) |
-| `compression.metal` | GPU カーネル (MSL 3.0): `compress_chunk`, `build_tans_tables`, `tans_encode`, `tans_decode`, `lz77_decode` |
-| `main.mm` | ホストドライバ (Objective-C++): O(1) ストリーミング・メガバッチ + 非同期ダブルバッファパイプライン |
-| `aplz` | ユーザー向け CLI ラッパー (Bash): ファイル/ディレクトリ対応、tar 統合 |
-| `install.sh` | インストーラ: 最適化ビルド (`-O3 -flto` + `.metallib`) + システムワイドデプロイ |
-| `setup_finder.sh` | macOS Finder Quick Action 生成 (右クリック圧縮/解凍) |
-| `build.sh` | 開発用ビルドスクリプト |
-| `bench_compress.sh` | gzip/zip/zstd/lz4/xz との比較ベンチマークスクリプト |
-
-## 技術詳細
-
-- LZ77: 4-gram 乗算ハッシュ (`h4`)、2-way ハッシュテーブル (`atomic_fetch_min`)、Run-Skipping、4 バイト並列マッチ比較、parallel prefix-sum コンパクション (`sparse` → `compact`)。最大一致長 255、最小一致長 3、後方距離最大 65534
-- Per-chunk tANS (v3): 各 64 KB チャンクの最適な tANS テーブルを GPU (`build_tans_tables`) で動的に構築する。128 インターリーブ ANS ストリーム、512 シンボル (256 literals + 256 match lengths)、L=1024、Duda's fast spread、Threadgroup cooperative loading によりテーブルを高速に参照する
-- ANS Encoding: 正規化付きフォワードエンコード、16-bit 距離フィールド、終端検出用センチネルビット
-- ANS Decoding: 最終状態からの逆順デコード、`clz()` によるセンチネル検出、ワード単位バッチビット抽出、O(1) デコードテーブル参照、ストリーム・状態境界バリデーション
-- Compact Frequency Serialization: Per-chunk 頻度テーブルを非ゼロエントリのみ保存 (`n_nonzero + [sym_id, freq]` ペア) してファイルサイズのオーバーヘッドを最小化する
-- 完全並列 LZ77 デコード: タイル単位の parallel prefix-scan によるバリデーション・リテラル書き込みと、モジュロ演算 (`out[off - dist + (j % dist)]`) による重複・非重複マッチの統一並列コピー（シリアルフォールバックなし）
-- 非同期ダブルバッファリング: GCD バッチパイプライン (32 chunks/batch, 2 slots)。`dispatch_semaphore` によるスロット排他、`dispatch_apply` による解凍テーブル並列構築、`addCompletedHandler` とシリアル `dispatch_queue` による順序保証付き非同期書き込み、圧縮時のアトミック `rename`
-- O(1) ストリーミング・メモリ: メガバッチ構成 (512 chunks = 32 MB/batch)。バッファを再利用するため、入力サイズに依存しない固定のメモリ使用量となる
-
-## 既知の制約
-
-- BS_CAP = 1024 B: 1 ストリームの最大出力は 1024 バイト。極端に膨張する非圧縮データではビットが切り捨てられる可能性がある。
-- チャンクサイズ固定 64 KB: `APLZ.h` / `compression.metal` で変更できるが、再ビルドが必要。
-
-## License
-
-MIT License. See [LICENSE](LICENSE) for details.
+- [SPEC.md](SPEC.md) — 詳細設計・数理・バイナリ仕様書
+- [src/rans/](src/rans/) — 32-way Coalesced rANS コア（Metal GPU / ARM64 NEON / Scalar リファレンス）
+- [src/engine/](src/engine/) — 3 スロット UMA 異種協調ブロックエンジン（`ASZ2`）
+- [src/asz/](src/asz/) — `.asz` ネイティブコンテナ・FastCDC・Solid Grouping・`asz` CLI
+- [tests/](tests/) — 自動検証スイートおよびベンチマーク
+- [build.sh](build.sh) / [install.sh](install.sh) / [setup_finder.sh](setup_finder.sh) — ビルド・インストール・macOS Finder サービス登録スクリプト

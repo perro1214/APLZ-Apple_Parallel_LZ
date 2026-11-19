@@ -28,9 +28,9 @@ APLZ-X は Apple Silicon（M1〜M4+）のハードウェア構造から逆算し
 
 | Phase | スコープ | 状態・検証結果 |
 |---|---|---|
-| **Phase 1** (`phase1_rans/`) | **32-way Coalesced rANS コア**（Metal GPU + ARM64 NEON + Scalar + 4-way ILP ブランチレス CPU Enc、256 KiB ブロック / 64 KiB タイル、テーブル共有、RAW/RLE フォールバック、破損検知） | **完了** — GPU Enc ↔ CPU Scalar / NEON / Fast Enc ↔ GPU Dec 全クロス 100% ビット完全一致・破損入力 100% 検知 |
-| **Phase 2** (`phase2_hetero/`) | **UMA 異種パイプラインエンジン (`ASZ2`)**（3 スロット非同期 `CPU \|\| GPU \|\| Pack+fwrite`、Zero-Cold-Start Hybrid、NEON Byte-Shuffle / ARM64 BCJ、エポック ハッシュ分離ストリーム LZ、2 スロット非同期 GPU デコード、256 KiB ランダムアクセス `decompress_range`） | **完了** — 252 ラウンドトリップ + 1-bit 破損検知 + 18 GPU==CPU パリティ全 PASS（警告 0） |
-| **Phase 3** (`phase3_asz/`) | **`.asz` ネイティブコンテナ & `asz` CLI**（一時 `.tar` 廃止、5 クラス型別 Solid Grouping、並列正規化 FastCDC 重複排除、O(1) 一覧表示、256 KiB ブロック単位部分展開、3 重 CRC32C 検査、Zip-Slip / symlink 逸脱完全防御、`install_asz.sh`） | **完了** — 自動テスト 8/8 PASS（警告 0）、979 ファイル実ディレクトリ・256 MiB・1.00 GiB ストリーミング検証完了 |
+| **Phase 1** (`src/rans/`) | **32-way Coalesced rANS コア**（Metal GPU + ARM64 NEON + Scalar + 4-way ILP ブランチレス CPU Enc、256 KiB ブロック / 64 KiB タイル、テーブル共有、RAW/RLE フォールバック、破損検知） | **完了** — GPU Enc ↔ CPU Scalar / NEON / Fast Enc ↔ GPU Dec 全クロス 100% ビット完全一致・破損入力 100% 検知 |
+| **Phase 2** (`src/engine/`) | **UMA 異種パイプラインエンジン (`ASZ2`)**（3 スロット非同期 `CPU \|\| GPU \|\| Pack+fwrite`、Zero-Cold-Start Hybrid、NEON Byte-Shuffle / ARM64 BCJ、エポック ハッシュ分離ストリーム LZ、2 スロット非同期 GPU デコード、256 KiB ランダムアクセス `decompress_range`） | **完了** — 252 ラウンドトリップ + 1-bit 破損検知 + 18 GPU==CPU パリティ全 PASS（警告 0） |
+| **Phase 3** (`src/asz/`) | **`.asz` ネイティブコンテナ & `asz` CLI**（一時 `.tar` 廃止、5 クラス型別 Solid Grouping、並列正規化 FastCDC 重複排除、O(1) 一覧表示、256 KiB ブロック単位部分展開、3 重 CRC32C 検査、Zip-Slip / symlink 逸脱完全防御、`install.sh` / `setup_finder.sh`） | **完了** — 自動テスト 8/8 PASS（警告 0）、979 ファイル実ディレクトリ・256 MiB・1.00 GiB ストリーミング検証完了 |
 
 ---
 
@@ -147,7 +147,7 @@ APLZ-X は Apple Silicon（M1〜M4+）のハードウェア構造から逆算し
 
 ## 3. Phase 2 詳細仕様: UMA 異種協調圧縮エンジン (`ASZ2`)
 
-Phase 2（`aplz_x/phase2_hetero/`）は、Phase 1 の 32-way Coalesced rANS をバックエンドに据え、ブロック単位の適応前処理・分離ストリーム LZ・非同期 UMA パイプラインを統合したコアエンジンである。
+Phase 2（`src/engine/`）は、Phase 1 の 32-way Coalesced rANS をバックエンドに据え、ブロック単位の適応前処理・分離ストリーム LZ・非同期 UMA パイプラインを統合したコアエンジンである。
 
 ### 3.1 3 スロット非同期 UMA パイプラインと Zero-Cold-Start Hybrid
 
@@ -267,7 +267,7 @@ Slot N   (Write Queue):[厳密順序保証・適応並列ゼロ中間コピー�
 
 ## 4. Phase 3 詳細仕様: `.asz` ネイティブコンテナ & アーカイバ
 
-Phase 3（`aplz_x/phase3_asz/`）は、一時 `.tar` ファイルを完全に廃止し、ディレクトリツリー・シンボリックリンク・POSIX 権限・更新時刻を単一 `.asz` コンテナへ直接格納するネイティブアーカイバおよび `asz` CLI である。
+Phase 3（`src/asz/`）は、一時 `.tar` ファイルを完全に廃止し、ディレクトリツリー・シンボリックリンク・POSIX 権限・更新時刻を単一 `.asz` コンテナへ直接格納するネイティブアーカイバおよび `asz` CLI である。
 
 ### 4.1 格納戦略: 型別 Solid Grouping + 並列正規化 FastCDC
 

@@ -21,7 +21,7 @@
 #include <algorithm>
 #include <cctype>
 
-#include "../phase2_hetero/hetero_format.h"
+#include "../engine/hetero_format.h"
 
 // ─── 定数・フラグ ──────────────────────────────────────────────────────────────
 static const uint8_t  ASZ_MAGIC[4]          = { 'A', 'S', 'Z', 0x01 };
