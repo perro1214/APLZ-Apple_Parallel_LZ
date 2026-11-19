@@ -50,9 +50,12 @@ echo "    $BUILD_DIR/bench_phase2"
 
 if [[ "${1:-}" == "test" ]]; then
     echo ""
-    echo "==> Running APLZ v4 automated test suite..."
+    echo "==> Running APLZ v4 archive verification suite (9/9)..."
     "$BUILD_DIR/test_archive" "$BUILD_DIR"
     echo ""
-    echo "==> Running CLI version & smoke check..."
+    echo "==> Running Phase 2 core correctness & GPU==CPU parity suite..."
+    "$BUILD_DIR/bench_phase2" "$BUILD_DIR" "$ROOT_DIR" --test-only
+    echo ""
+    echo "==> Running CLI version check..."
     "$BUILD_DIR/aplz" --version
 fi

@@ -1,5 +1,7 @@
 # APLZ v4 (`.aplz`) — Apple Silicon UMA 異種協調アーカイバ
 
+[![CI](https://github.com/perro1214/APLZ-Apple_Parallel_LZ/actions/workflows/ci.yml/badge.svg)](https://github.com/perro1214/APLZ-Apple_Parallel_LZ/actions/workflows/ci.yml)
+
 [English README](README.md)
 
 **APLZ（`aplz`）** は、Apple Silicon（M1〜M4+）のユニファイドメモリアーキテクチャ（UMA）とハードウェア構造から逆算して設計した、次世代ロスレス圧縮・ネイティブアーカイブツールです。

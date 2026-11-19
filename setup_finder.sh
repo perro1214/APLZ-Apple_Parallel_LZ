@@ -40,14 +40,17 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 find_aplz() {
+    local in_path
+    in_path="$(command -v aplz 2>/dev/null || true)"
     local candidates=(
         "$HOME/.local/bin/aplz"
         "/usr/local/bin/aplz"
         "/opt/homebrew/bin/aplz"
+        "$in_path"
         "$ROOT_DIR/build/aplz"
     )
     for c in "${candidates[@]}"; do
-        [[ -x "$c" ]] && echo "$c" && return
+        [[ -n "$c" && -x "$c" ]] && echo "$c" && return
     done
     echo ""
 }

@@ -1,5 +1,7 @@
 # APLZ v4 (`.aplz`) — Apple Silicon UMA Heterogeneous Archiver
 
+[![CI](https://github.com/perro1214/APLZ-Apple_Parallel_LZ/actions/workflows/ci.yml/badge.svg)](https://github.com/perro1214/APLZ-Apple_Parallel_LZ/actions/workflows/ci.yml)
+
 [日本語版 README はこちら](README.ja.md)
 
 **APLZ (`aplz`)** is a lossless compressor and native archive format engineered from the ground up for **Apple Silicon (M1–M4+)** Unified Memory Architecture (UMA).

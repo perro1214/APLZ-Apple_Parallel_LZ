@@ -188,7 +188,7 @@ static void gen_dataset(std::vector<uint8_t>& dst, size_t size, int kind, const 
 }
 
 // ─── 1. 厳密正確性スイート ─────────────────────────────────────────────────────
-static void run_correctness(HeteroEngine& eng, const char* repo_root) {
+static void run_correctness(HeteroEngine& eng, const char* repo_root, bool has_gpu) {
     printf("=== [1] Phase 2 Correctness & Corruption Detection Suite ===\n");
     const size_t sizes[] = {
         0, 1, 15, 63, 64, 255, 256, 4096, 65535, 65536, 262143, 262144, 262145, 524300
@@ -227,52 +227,55 @@ static void run_correctness(HeteroEngine& eng, const char* repo_root) {
         exit(1);
     }
 
-    // GPU 32-way rANS と CPU ブランチレス 32-way rANS のビット完全一致テスト (全6データセット×3レベル)
-    std::vector<uint8_t> arch_gpu, arch_cpu, dec_cross;
-    for (int kind = 0; kind < 6; ++kind) {
-        gen_dataset(src, 300000, kind, repo_root);
-        for (uint32_t lv : levels) {
-            eng.force_cpu_rans = false;
-            if (!eng.compress(src.data(), src.size(), lv, arch_gpu)) {
-                fprintf(stderr, "[FAIL] GPU parity compress failed kind=%d lv=%u\n", kind, lv);
-                exit(1);
-            }
-            eng.force_cpu_rans = true;
-            if (!eng.compress(src.data(), src.size(), lv, arch_cpu)) {
-                fprintf(stderr, "[FAIL] CPU parity compress failed kind=%d lv=%u\n", kind, lv);
-                exit(1);
-            }
-            if (arch_gpu != arch_cpu) {
-                fprintf(stderr, "[FAIL] GPU vs CPU archive NOT bit-exact! kind=%d lv=%u (gpu=%zu cpu=%zu)\n",
-                        kind, lv, arch_gpu.size(), arch_cpu.size());
-                exit(1);
-            }
-            // CPU 復号で GPU 生成アーカイブを検証 & GPU 復号で CPU 生成アーカイブを検証
-            if (!eng.decompress(arch_gpu.data(), arch_gpu.size(), dec_cross) || dec_cross != src) {
-                fprintf(stderr, "[FAIL] CPU decode of GPU archive mismatch kind=%d lv=%u\n", kind, lv);
-                exit(1);
-            }
-            eng.force_cpu_rans = false;
-            if (!eng.decompress(arch_cpu.data(), arch_cpu.size(), dec_cross) || dec_cross != src) {
-                fprintf(stderr, "[FAIL] GPU decode of CPU archive mismatch kind=%d lv=%u\n", kind, lv);
-                exit(1);
+    if (has_gpu) {
+        // GPU 32-way rANS と CPU ブランチレス 32-way rANS のビット完全一致テスト (全6データセット×3レベル)
+        std::vector<uint8_t> arch_gpu, arch_cpu, dec_cross;
+        for (int kind = 0; kind < 6; ++kind) {
+            gen_dataset(src, 300000, kind, repo_root);
+            for (uint32_t lv : levels) {
+                eng.force_cpu_rans = false;
+                if (!eng.compress(src.data(), src.size(), lv, arch_gpu)) {
+                    fprintf(stderr, "[FAIL] GPU parity compress failed kind=%d lv=%u\n", kind, lv);
+                    exit(1);
+                }
+                eng.force_cpu_rans = true;
+                if (!eng.compress(src.data(), src.size(), lv, arch_cpu)) {
+                    fprintf(stderr, "[FAIL] CPU parity compress failed kind=%d lv=%u\n", kind, lv);
+                    exit(1);
+                }
+                if (arch_gpu != arch_cpu) {
+                    fprintf(stderr, "[FAIL] GPU vs CPU archive NOT bit-exact! kind=%d lv=%u (gpu=%zu cpu=%zu)\n",
+                            kind, lv, arch_gpu.size(), arch_cpu.size());
+                    exit(1);
+                }
+                // CPU 復号で GPU 生成アーカイブを検証 & GPU 復号で CPU 生成アーカイブを検証
+                if (!eng.decompress(arch_gpu.data(), arch_gpu.size(), dec_cross) || dec_cross != src) {
+                    fprintf(stderr, "[FAIL] CPU decode of GPU archive mismatch kind=%d lv=%u\n", kind, lv);
+                    exit(1);
+                }
+                eng.force_cpu_rans = false;
+                if (!eng.decompress(arch_cpu.data(), arch_cpu.size(), dec_cross) || dec_cross != src) {
+                    fprintf(stderr, "[FAIL] GPU decode of CPU archive mismatch kind=%d lv=%u\n", kind, lv);
+                    exit(1);
+                }
             }
         }
+        printf("  [PASS] %u boundary/dataset/level round-trip cases + 1-bit corruption + 18 GPU==CPU bit-exact parity: ALL OK!\n\n", passed);
+    } else {
+        printf("  [PASS] %u boundary/dataset/level round-trip cases + 1-bit corruption: ALL OK! (GPU parity skipped: no Metal GPU in VM)\n\n", passed);
     }
-
-    printf("  [PASS] %u boundary/dataset/level round-trip cases + 1-bit corruption + 18 GPU==CPU bit-exact parity: ALL OK!\n\n", passed);
 }
 
-// ─── 2. 64 MiB インメモリ詳細ベンチマーク (各ステージ内訳付き) ──────────────────
-static void run_inmem_bench(HeteroEngine& eng, const char* repo_root) {
-    const size_t SIZE_MB = 64u;
+// ─── 2. インメモリ詳細ベンチマーク (各ステージ内訳付き) ────────────────────────
+static void run_inmem_bench(HeteroEngine& eng, const char* repo_root, size_t size_mb = 64u, int runs = 3) {
+    const size_t SIZE_MB = size_mb;
     const size_t SIZE    = SIZE_MB * 1024u * 1024u;
     const char* names[6] = {
         "Source+Docs", "Mach-O ARM64", "FP16 Weights", "FP32 Telemetry", "Mixed Real", "Random"
     };
 
-    printf("=== [2] APLZ-X Phase 2 In-Memory Benchmark (%zu MiB, best of 3 runs) ===\n", SIZE_MB);
-    printf("Device: %s\n\n", eng.dev.name.UTF8String);
+    printf("=== [2] APLZ Phase 2 In-Memory Benchmark (%zu MiB, best of %d runs) ===\n", SIZE_MB, runs);
+    printf("Device: %s\n\n", eng.dev ? eng.dev.name.UTF8String : "Apple Silicon CPU (No Metal GPU in VM)");
 
     std::vector<uint8_t> src, arch, dec;
 
@@ -291,12 +294,12 @@ static void run_inmem_bench(HeteroEngine& eng, const char* repo_root) {
             HxTimingStats best_cs, best_ds;
             best_cs.total_s = 1e9;
             best_ds.total_s = 1e9;
-            for (int r = 0; r < 3; ++r) {
+            for (int r = 0; r < runs; ++r) {
                 HxTimingStats cs;
                 eng.compress(src.data(), src.size(), lv, arch, &cs);
                 if (cs.total_s < best_cs.total_s) best_cs = cs;
             }
-            for (int r = 0; r < 3; ++r) {
+            for (int r = 0; r < runs; ++r) {
                 HxTimingStats ds;
                 bool ok = eng.decompress(arch.data(), arch.size(), dec, &ds);
                 if (!ok || dec.size() != src.size() || memcmp(dec.data(), src.data(), SIZE) != 0) {
@@ -358,9 +361,23 @@ int main(int argc, const char* argv[]) {
         HeteroEngine eng;
         // --encode / --decode 単発起動は遅延 Metal 初期化 (RAW や小ファイルで起動遅延ゼロ!)
         bool is_cli_oneshot = (argc >= 5 && (strcmp(argv[2], "--encode") == 0 || strcmp(argv[2], "--decode") == 0));
-        if (!eng.init(shader_dir, !is_cli_oneshot)) {
-            fprintf(stderr, "[ERR] Failed to initialize HeteroEngine.\n");
-            return 1;
+        bool has_gpu = false;
+        if (is_cli_oneshot) {
+            if (!eng.init(shader_dir, false)) {
+                fprintf(stderr, "[ERR] Failed to initialize HeteroEngine.\n");
+                return 1;
+            }
+        } else {
+            if (eng.init(shader_dir, true)) {
+                has_gpu = true;
+            } else {
+                fprintf(stderr, "[INFO] No Metal GPU device available (e.g. CI VM); running CPU NEON backend.\n");
+                if (!eng.init(shader_dir, false)) {
+                    fprintf(stderr, "[ERR] Failed to initialize CPU fallback.\n");
+                    return 1;
+                }
+                eng.force_cpu_rans = true;
+            }
         }
 
         if (argc >= 6 && strcmp(argv[2], "--encode") == 0) {
@@ -371,9 +388,17 @@ int main(int argc, const char* argv[]) {
             return eng.decompress_file(argv[3], argv[4]) ? 0 : 1;
         }
 
-        const char* repo_root = (argc >= 3) ? argv[2] : "../..";
-        run_correctness(eng, repo_root);
-        run_inmem_bench(eng, repo_root);
+        const char* repo_root = (argc >= 3 && argv[2][0] != '-') ? argv[2] : ".";
+        bool ci_mode   = false;
+        bool test_only = false;
+        for (int i = 2; i < argc; ++i) {
+            if (strcmp(argv[i], "--ci") == 0)        ci_mode = true;
+            if (strcmp(argv[i], "--test-only") == 0) test_only = true;
+        }
+        run_correctness(eng, repo_root, has_gpu);
+        if (!test_only) {
+            run_inmem_bench(eng, repo_root, ci_mode ? 16u : 64u, ci_mode ? 2 : 3);
+        }
         return 0;
     }
 }

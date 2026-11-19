@@ -1,0 +1,56 @@
+name: CI (macOS Apple Silicon)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & Verify (macOS arm64)
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile Metal 3.0 shaders & targets (-Wall -Wextra -Werror)
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcrun -sdk macosx metal -std=metal3.0 -O3 -c src/rans/rans32.metal -o build/rans32.air
+          xcrun -sdk macosx metallib build/rans32.air -o build/rans32.metallib
+          xcrun -sdk macosx metal -std=metal3.0 -O3 -c src/engine/hetero_kernels.metal -o build/hetero_kernels.air
+          xcrun -sdk macosx metallib build/hetero_kernels.air -o build/hetero_kernels.metallib
+
+          FLAGS=(-std=c++17 -O3 -flto -march=armv8.5-a+crc -Wall -Wextra -Werror -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore)
+          clang++ "${FLAGS[@]}" src/archive/aplz_main.mm -o build/aplz
+          clang++ "${FLAGS[@]}" tests/test_archive.mm    -o build/test_archive
+          clang++ "${FLAGS[@]}" tests/bench_rans32.mm    -o build/bench_rans32
+          clang++ "${FLAGS[@]}" tests/bench_phase2.mm    -o build/bench_phase2
+
+      - name: Run APLZ v4 archive verification suite (9/9)
+        run: ./build/test_archive ./build
+
+      - name: Run Phase 2 core correctness & corruption suite (252 cases)
+        run: ./build/bench_phase2 ./build . --test-only
+
+      - name: Verify install.sh & setup_finder.sh
+        run: |
+          set -euo pipefail
+          ./install.sh --prefix /tmp/aplz_ci_prefix
+          /tmp/aplz_ci_prefix/bin/aplz --version
+          PATH="/tmp/aplz_ci_prefix/bin:$PATH" ./setup_finder.sh
+          plutil -lint "$HOME/Library/Services/APLZ で圧縮.workflow/Contents/Info.plist"
+          plutil -lint "$HOME/Library/Services/APLZ で圧縮.workflow/Contents/document.wflow"
+          plutil -lint "$HOME/Library/Services/APLZ で解凍.workflow/Contents/Info.plist"
+          plutil -lint "$HOME/Library/Services/APLZ で解凍.workflow/Contents/document.wflow"
+          ./setup_finder.sh --uninstall
+          ./install.sh --prefix /tmp/aplz_ci_prefix --uninstall
+          rm -rf /tmp/aplz_ci_prefix
