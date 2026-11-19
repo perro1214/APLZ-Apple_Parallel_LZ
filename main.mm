@@ -2,7 +2,7 @@
 //
 // Per-chunk tANS テーブル + O(1) ストリーミング・メガバッチ・パイプライン
 //
-//   圧縮: メガバッチ単位で Pass1 → CPU per-chunk テーブル構築 → Pass2
+//   圧縮: メガバッチ単位で Pass1 → GPU per-chunk テーブル構築 → Pass2
 //          Pass1 は 1 回のみ (v2 の 2 回実行を解消)
 //   解凍: メガバッチ単位で読み込み → CPU per-chunk デコードテーブル構築 → GPU decode
 
@@ -29,7 +29,7 @@
 #include "APLZ.h"
 
 // ─── デバッグフラグ ────────────────────────────────────────────────────────────
-static bool g_debug = true;
+static bool g_debug = false;
 #define DLOG(fmt, ...) \
     do { if (g_debug) fprintf(stderr, "[APLZ DBG] " fmt "\n", ##__VA_ARGS__); } while(0)
 
@@ -84,66 +84,7 @@ static id<MTLLibrary> compile_shader(id<MTLDevice> dev, const char* path) {
     return lib;
 }
 
-// ─── Per-chunk ヒストグラム → SymInfo 正規化 ─────────────────────────────────
-static uint32_t compute_chunk_histogram(const LzToken* compact, uint32_t cnt,
-                                        uint32_t* freq) {
-    memset(freq, 0, N_SYMBOLS * sizeof(uint32_t));
-    uint32_t matches = 0;
-    for (uint32_t i = 0; i < cnt; ++i) {
-        if (compact[i].is_match) {
-            freq[256 + compact[i].val]++;
-            matches++;
-        } else {
-            freq[compact[i].val]++;
-        }
-    }
-    return matches;
-}
-
-static void normalize_histogram(const uint32_t* raw, SymInfo* si) {
-    uint64_t total = 0;
-    for (uint32_t i = 0; i < N_SYMBOLS; i++) total += raw[i];
-
-    if (total == 0) {
-        memset(si, 0, N_SYMBOLS * sizeof(SymInfo));
-        si[0].freq = (uint16_t)ANS_L;
-        for (uint32_t i = 0; i < N_SYMBOLS; i++)
-            si[i].cum_freq = (i == 0) ? 0 : si[0].freq;
-        return;
-    }
-
-    uint32_t nf[N_SYMBOLS];
-    uint32_t assigned = 0;
-    for (uint32_t i = 0; i < N_SYMBOLS; i++) {
-        if (raw[i] == 0) { nf[i] = 0; continue; }
-        nf[i] = std::max(1u, (uint32_t)((uint64_t)raw[i] * ANS_L / total));
-        assigned += nf[i];
-    }
-
-    uint32_t best = 0;
-    for (uint32_t i = 1; i < N_SYMBOLS; i++)
-        if (raw[i] > raw[best]) best = i;
-
-    int32_t diff = (int32_t)ANS_L - (int32_t)assigned;
-    if ((int32_t)nf[best] + diff >= 1) {
-        nf[best] += diff;
-    } else {
-        while (assigned != ANS_L) {
-            for (uint32_t i = 0; i < N_SYMBOLS && assigned != ANS_L; i++) {
-                if (assigned < ANS_L && nf[i] > 0)  { nf[i]++; assigned++; }
-                if (assigned > ANS_L && nf[i] > 1)  { nf[i]--; assigned--; }
-            }
-        }
-    }
-
-    uint16_t cum = 0;
-    for (uint32_t i = 0; i < N_SYMBOLS; i++) {
-        si[i].freq     = (uint16_t)nf[i];
-        si[i].cum_freq = cum;
-        cum += (uint16_t)nf[i];
-    }
-}
-
+// ─── Per-chunk tANS デコードテーブル構築 (解凍用) ────────────────────────────
 static void build_spread_table(const SymInfo* si, uint16_t* spread) {
     const uint32_t step = (ANS_L >> 1) + (ANS_L >> 3) + 3;
     const uint32_t mask = ANS_L - 1;
@@ -153,16 +94,6 @@ static void build_spread_table(const SymInfo* si, uint16_t* spread) {
             spread[pos] = (uint16_t)s;
             pos = (pos + step) & mask;
         }
-    }
-}
-
-static void build_encode_table(const SymInfo* si, const uint16_t* spread,
-                               uint16_t* enc_table) {
-    uint32_t rank[N_SYMBOLS] = {};
-    for (uint32_t p = 0; p < ANS_L; p++) {
-        uint32_t s = spread[p];
-        uint32_t j = rank[s]++;
-        enc_table[si[s].cum_freq + j] = (uint16_t)(ANS_L + p);
     }
 }
 
@@ -353,6 +284,16 @@ static int compress(const char* in_path, const char* out_path, const char* shade
         return EXIT_FAILURE;
     }
 
+    // GPUテーブル構築カーネル（CPUオフロード用）
+    id<MTLFunction> fn_build = [lib newFunctionWithName:@"build_tans_tables"];
+    if (!fn_build) { fprintf(stderr, "[APLZ] 'build_tans_tables' not found.\n"); return EXIT_FAILURE; }
+    NSError* pso_build_err = nil;
+    id<MTLComputePipelineState> pso_build = [dev newComputePipelineStateWithFunction:fn_build error:&pso_build_err];
+    if (!pso_build) {
+        fprintf(stderr, "[APLZ] PSO_build: %s\n", pso_build_err.localizedDescription.UTF8String);
+        return EXIT_FAILURE;
+    }
+
     // Per-batch テーブルバッファ (ダブルバッファ)
     // sym_arr: SymInfo[BATCH_CHUNKS][N_SYMBOLS], enc_arr: uint16_t[BATCH_CHUNKS][ANS_L]
     id<MTLBuffer> slot_sym[N_BUFS], slot_enc[N_BUFS];
@@ -366,6 +307,17 @@ static int compress(const char* in_path, const char* out_path, const char* shade
                                          options:MTLResourceStorageModeShared];
         slot_bsz[s]   = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * N_STREAMS * sizeof(uint32_t)
                                           options:MTLResourceStorageModeShared];
+    }
+
+    // メガバッチ用GPUテーブル構築バッファ（ダブルバッファ）
+    id<MTLBuffer> mb_sym[N_BUFS], mb_enc[N_BUFS], mb_match_cnt[N_BUFS];
+    for (uint32_t s = 0; s < N_BUFS; s++) {
+        mb_sym[s]       = [dev newBufferWithLength:(size_t)mb_chunks * N_SYMBOLS * sizeof(SymInfo)
+                                           options:MTLResourceStorageModeShared];
+        mb_enc[s]       = [dev newBufferWithLength:(size_t)mb_chunks * ANS_L * sizeof(uint16_t)
+                                           options:MTLResourceStorageModeShared];
+        mb_match_cnt[s] = [dev newBufferWithLength:(size_t)mb_chunks * sizeof(uint32_t)
+                                           options:MTLResourceStorageModeShared];
     }
 
     CFTimeInterval t_total_start = CACurrentMediaTime();
@@ -425,17 +377,8 @@ static int compress(const char* in_path, const char* out_path, const char* shade
         dispatch_semaphore_wait(pass1_sem[sl_mb], DISPATCH_TIME_FOREVER);
         CFTimeInterval t_pass1_done = CACurrentMediaTime();
         DLOG("[timing] mega-batch %u Pass1 GPU wait: %.3f ms", mb, (t_pass1_done - t_pass1_wait) * 1000.0);
-        uint32_t mb_prefetch = mb + N_BUFS;
-        if (mb_prefetch < n_mega) {
-            uint32_t sl_pf = mb_prefetch % N_BUFS;
-            uint32_t pf_start = mb_prefetch * mb_chunks;
-            uint32_t pf_count = std::min(mb_chunks, num_chunks - pf_start);
-            pass1_sem[sl_pf] = dispatch_pass1(cq, pso1, buf_in, pass1_sparse[sl_pf], pass1_compact[sl_pf], pass1_cnt[sl_pf],
-                                              pf_start, pf_count, file_size);
-        }
         DLOG("[compress] mega-batch %u/%u: mc_start=%u mc_count=%u", mb, n_mega, mc_start, mc_count);
 
-        const LzToken*  compact_ptr = (const LzToken*)pass1_compact[sl_mb].contents;
         const uint32_t* cnt_ptr     = (const uint32_t*)pass1_cnt[sl_mb].contents;
 
         // カウント収集
@@ -447,24 +390,43 @@ static int compress(const char* in_path, const char* out_path, const char* shade
         std::vector<uint32_t> mb_cnt(cnt_ptr, cnt_ptr + mc_count);
 
         CFTimeInterval t_table_start = CACurrentMediaTime();
-        // ── Per-chunk テーブル構築 + Pass2 バッチパイプライン ─────────────
-        // per-chunk の SymInfo を構築して配列に格納
-        // 全メガバッチ分の SymInfo を保持 (ファイル書き出しに必要)
-        std::vector<SymInfo> mb_sym_infos(mc_count * N_SYMBOLS);
+        // ── GPU側でtANSテーブル構築（CPUオフロード）────────────────────────
+        // build_tans_tablesカーネルでヒストグラム→正規化→spread table→エンコードテーブルをGPU内で完結
+        id<MTLCommandBuffer> cb_build = [cq commandBuffer];
+        id<MTLComputeCommandEncoder> enc_build = [cb_build computeCommandEncoder];
+        [enc_build setComputePipelineState:pso_build];
+        [enc_build setBuffer:pass1_compact[sl_mb] offset:0 atIndex:0];
+        [enc_build setBuffer:pass1_cnt[sl_mb]     offset:0 atIndex:1];
+        [enc_build setBuffer:mb_sym[sl_mb]        offset:0 atIndex:2];
+        [enc_build setBuffer:mb_enc[sl_mb]        offset:0 atIndex:3];
+        [enc_build setBuffer:mb_match_cnt[sl_mb]  offset:0 atIndex:4];
+        [enc_build dispatchThreadgroups:MTLSizeMake(mc_count, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
+        [enc_build endEncoding];
 
-        CFTimeInterval t_hist_start = CACurrentMediaTime();
+        dispatch_semaphore_t build_sem = dispatch_semaphore_create(0);
+        [cb_build addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+            if (completed.error) {
+                fprintf(stderr, "[APLZ] build_tans_tables error: %s\n",
+                        completed.error.localizedDescription.UTF8String);
+                exit(EXIT_FAILURE);
+            }
+            dispatch_semaphore_signal(build_sem);
+        }];
+        [cb_build commit];
+
+        // GPUテーブル構築完了を待機
+        dispatch_semaphore_wait(build_sem, DISPATCH_TIME_FOREVER);
+        CFTimeInterval t_build_done = CACurrentMediaTime();
+        DLOG("[timing] mega-batch %u GPU table build: %.3f ms", mb, (t_build_done - t_table_start) * 1000.0);
+
+        // GPU構築されたSymInfoを保持（ファイル書き出し用）& 実マッチ数を集計
+        std::vector<SymInfo> mb_sym_infos(mc_count * N_SYMBOLS);
+        memcpy(mb_sym_infos.data(), mb_sym[sl_mb].contents, mc_count * N_SYMBOLS * sizeof(SymInfo));
+        const uint32_t* match_ptr = (const uint32_t*)mb_match_cnt[sl_mb].contents;
         for (uint32_t c = 0; c < mc_count; c++) {
-            SymInfo* si = &mb_sym_infos[c * N_SYMBOLS];
-            uint32_t raw_freq[N_SYMBOLS];
-            uint32_t chunk_matches = compute_chunk_histogram(
-                compact_ptr + (uint64_t)c * CHUNK_SIZE, cnt_ptr[c], raw_freq);
-            total_matches += chunk_matches;
-            normalize_histogram(raw_freq, si);
+            total_matches += match_ptr[c];
         }
-        CFTimeInterval t_hist_done = CACurrentMediaTime();
-        DLOG("[timing] mega-batch %u CPU histogram: %.3f ms (%.1f ms/chunk)",
-             mb, (t_hist_done - t_hist_start) * 1000.0,
-             (t_hist_done - t_hist_start) * 1000.0 / mc_count);
 
         // Pass2 ダブルバッファ バッチループ
         uint32_t mb_n_batches = (mc_count + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
@@ -478,18 +440,14 @@ static int compress(const char* in_path, const char* out_path, const char* shade
             DLOG("  [compress] batch %u/%u slot=%u gc=%u..%u",
                  b, mb_n_batches, sl, gc_start, gc_start + lc_count - 1);
 
-            // Per-chunk テーブルをスロットバッファにコピー
+            // GPU構築されたテーブルをスロットバッファにコピー（CPU側での再構築は不要）
             SymInfo*  sym_dst = (SymInfo*)slot_sym[sl].contents;
             uint16_t* enc_dst = (uint16_t*)slot_enc[sl].contents;
-            dispatch_apply(lc_count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t ilc) {
-                uint32_t lc = (uint32_t)ilc;
-                const SymInfo* si = &mb_sym_infos[(lc_start + lc) * N_SYMBOLS];
-                memcpy(sym_dst + (size_t)lc * N_SYMBOLS, si, N_SYMBOLS * sizeof(SymInfo));
-                uint16_t spread_local[ANS_L];
-                build_spread_table(si, spread_local);
-                uint16_t* enc = enc_dst + (size_t)lc * ANS_L;
-                build_encode_table(si, spread_local, enc);
-            });
+            SymInfo*  mb_sym_ptr = (SymInfo*)mb_sym[sl_mb].contents;
+            uint16_t* mb_enc_ptr = (uint16_t*)mb_enc[sl_mb].contents;
+
+            memcpy(sym_dst, mb_sym_ptr + lc_start * N_SYMBOLS, lc_count * N_SYMBOLS * sizeof(SymInfo));
+            memcpy(enc_dst, mb_enc_ptr + lc_start * ANS_L, lc_count * ANS_L * sizeof(uint16_t));
 
             id<MTLCommandBuffer> cb = [cq commandBuffer];
             id<MTLComputeCommandEncoder> enc2 = [cb computeCommandEncoder];
@@ -545,10 +503,10 @@ static int compress(const char* in_path, const char* out_path, const char* shade
                         append_compact_freq(chunk_blob, si);
 
                         // stream sizes + data (coalesced payload write)
-                        uint16_t ssz[256];
+                        uint16_t ssz[N_STREAMS];
                         size_t payload_size = 0;
-                        for (uint32_t s = 0; s < 256; s++) {
-                            ssz[s] = (uint16_t)bsz[(size_t)lc * 256 + s];
+                        for (uint32_t s = 0; s < N_STREAMS; s++) {
+                            ssz[s] = (uint16_t)bsz[(size_t)lc * N_STREAMS + s];
                             payload_size += ssz[s];
                         }
                         chunk_blob.insert(chunk_blob.end(),
@@ -557,9 +515,9 @@ static int compress(const char* in_path, const char* out_path, const char* shade
 
                         std::vector<uint8_t> payload(payload_size);
                         size_t off = 0;
-                        for (uint32_t s = 0; s < 256; s++) {
+                        for (uint32_t s = 0; s < N_STREAMS; s++) {
                             if (ssz[s] > 0) {
-                                const uint8_t* sdata = bs + ((size_t)lc * 256 + s) * BS_CAP;
+                                const uint8_t* sdata = bs + ((size_t)lc * N_STREAMS + s) * BS_CAP;
                                 memcpy(payload.data() + off, sdata, ssz[s]);
                                 off += ssz[s];
                             }
@@ -581,6 +539,14 @@ static int compress(const char* in_path, const char* out_path, const char* shade
 
         // メガバッチ完了待ち
         dispatch_group_wait(done_grp, DISPATCH_TIME_FOREVER);
+        uint32_t mb_prefetch = mb + N_BUFS;
+        if (mb_prefetch < n_mega) {
+            uint32_t sl_pf = mb_prefetch % N_BUFS;
+            uint32_t pf_start = mb_prefetch * mb_chunks;
+            uint32_t pf_count = std::min(mb_chunks, num_chunks - pf_start);
+            pass1_sem[sl_pf] = dispatch_pass1(cq, pso1, buf_in, pass1_sparse[sl_pf], pass1_compact[sl_pf], pass1_cnt[sl_pf],
+                                              pf_start, pf_count, file_size);
+        }
     }
 
     CFTimeInterval t_pipe_end = CACurrentMediaTime();
@@ -848,15 +814,16 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                     // (v2ファイルはこのコードパスに来ないはず)
                 }
 
-                uint16_t ssz[256];
-                if ((size_t)(file_end - cp) < sizeof(ssz)) {
+                size_t ssz_bytes = (size_t)ns * sizeof(uint16_t);
+                std::vector<uint16_t> ssz(ns);
+                if ((size_t)(file_end - cp) < ssz_bytes) {
                     fprintf(stderr, "[APLZ] Failed to read stream sizes at chunk %u\n", gc);
                     munmap(mapped, in_size); close(fd); fclose(fout); unlink(out_path); return EXIT_FAILURE;
                 }
-                memcpy(ssz, cp, sizeof(ssz));
-                cp += sizeof(ssz);
+                memcpy(ssz.data(), cp, ssz_bytes);
+                cp += ssz_bytes;
                 size_t stream_total = 0;
-                for (uint32_t s = 0; s < 256; s++) stream_total += ssz[s];
+                for (uint32_t s = 0; s < ns; s++) stream_total += ssz[s];
                 if (stream_total > stream_read_cap) {
                     fprintf(stderr, "[APLZ] Stream payload too large at chunk %u (%zu > %zu)\n",
                             gc, stream_total, stream_read_cap);
@@ -869,9 +836,9 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                 DLOG("    chunk %u: token_cnt=%u stream_total=%zu bytes",
                      gc, tcnt_data[lc], stream_total);
                 const uint8_t* src = cp;
-                for (uint32_t s = 0; s < 256; s++) {
-                    bsz_data[(size_t)lc * 256 + s] = (uint32_t)ssz[s];
-                    memcpy(bs_data + ((size_t)lc * 256 + s) * BS_CAP, src, ssz[s]);
+                for (uint32_t s = 0; s < ns; s++) {
+                    bsz_data[(size_t)lc * N_STREAMS + s] = (uint32_t)ssz[s];
+                    memcpy(bs_data + ((size_t)lc * N_STREAMS + s) * BS_CAP, src, ssz[s]);
                     src += ssz[s];
                 }
                 cp += stream_total;

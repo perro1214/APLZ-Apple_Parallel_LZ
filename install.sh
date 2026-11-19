@@ -26,7 +26,7 @@ if [[ "${1:-}" == "uninstall" ]]; then
     echo "==> Uninstalling APLZ..."
     for prefix in "$HOME/.local" "/usr/local"; do
         local_bin="${prefix}/bin"
-        for f in gpu_zip aplz compression.metal; do
+        for f in gpu_zip aplz compression.metal compression.metallib; do
             if [[ -f "${local_bin}/${f}" ]]; then
                 echo "    Removing: ${local_bin}/${f}"
                 rm -f "${local_bin}/${f}" 2>/dev/null || sudo rm -f "${local_bin}/${f}"

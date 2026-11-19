@@ -6,13 +6,13 @@ Moteur de compression/décompression sans perte à haute vitesse fonctionnant su
 
 ## Points forts
 
-- **Zero-copy I/O** : Exploite l'Unified Memory Architecture (UMA) d'Apple Silicon. `mmap` + `newBufferWithBytesNoCopy` élimine toutes les copies de données CPU↔GPU
-- **LZ77 parallèle** : 256 threads traitent coopérativement chaque bloc de 64 Ko. Hash à 2 voies (atomic_fetch_min) pour une recherche rapide de correspondances
-- **tANS entrelacé par bloc (256 flux)** : Construit dynamiquement des tables tANS optimales par bloc. Chaque thread maintient un état ANS indépendant, encodant/décodant 256 flux de bits en parallèle
-- **Décodage LZ77 parallèle** : Les correspondances sans chevauchement sont copiées en parallèle par 256 threads ; les correspondances chevauchantes (dist < len) utilisent un repli séquentiel. Optimisation par réduction de barrières incluse
-- **Double tampon asynchrone** : Pipeline par lots basé sur GCD (`dispatch_semaphore` / `dispatch_group`). Recouvre complètement l'exécution GPU avec les E/S CPU
+- **Zero-copy I/O** : Exploite l'Unified Memory Architecture (UMA) d'Apple Silicon. `mmap` + `newBufferWithBytesNoCopy` élimine les copies d'entrée CPU↔GPU
+- **LZ77 parallèle** : 128 threads traitent coopérativement chaque bloc de 64 Ko avec un hachage multiplicatif 4-grammes (`h4`), une table de hachage à 2 voies (`atomic_fetch_min`), Run-Skipping, comparaison parallèle 4 octets et compactage par parallel prefix-sum
+- **tANS entrelacé par bloc sur GPU (128 flux)** : Construit dynamiquement des tables tANS optimales par bloc directement sur GPU (`build_tans_tables`). Chaque thread maintient un état ANS indépendant, encodant/décodant 128 flux de bits en parallèle
+- **Décodage LZ77 entièrement parallèle** : Prefix-scan parallèle par tuiles pour validation et écriture des littéraux, suivi d'une copie parallèle unifiée par modulo sur 128 threads — y compris pour les correspondances chevauchantes (`dist < len`), sans repli séquentiel
+- **Double tampon asynchrone** : Pipeline par lots basé sur GCD (`dispatch_semaphore` / `dispatch_group`). Recouvre l'exécution GPU avec la préparation des tables CPU et les E/S fichiers asynchrones
 - **Mémoire O(1) en streaming** : Utilisation mémoire fixe indépendante de la taille d'entrée. Traite en mega-batches (32 Mo) pour un fonctionnement stable sur des fichiers de 5 Go+
-- **Round-trip parfait** : Garantit une correspondance exacte au niveau octet après compression → décompression
+- **Round-trip parfait** : Garantit une correspondance exacte au niveau octet après compression → décompression, avec validation GPU des flux ANS/LZ
 
 ## Architecture
 
@@ -22,36 +22,29 @@ Moteur de compression/décompression sans perte à haute vitesse fonctionnant su
 mmap(input)  <- zero-copy MTLBuffer (Apple Silicon UMA)
     |
     v
-╔══════════════════════════════════════════════════════╗
-║  Phase A: GPU Pass 1 x mega-batch (32MB streaming)   ║
-║  ┌────────────────────────────────────────────────┐  ║
-║  │ compress_chunk (512 chunks/mega-batch)         │  ║
-║  │   A-1  Hash table init                         │  ║
-║  │   A-2  3-gram hash (atomic_fetch_min x 2)      │  ║
-║  │   A-3  LZ77 match search -> sparse[]           │  ║
-║  │   B    Greedy overlap resolution -> compact[]  │  ║
-║  │   1 threadgroup (256 threads) = 1 chunk (64KB) │  ║
-║  └────────────────────────────────────────────────┘  ║
-║  -> per-chunk histogram -> reuse buffers -> next 32MB║
-╚══════════════════════════════════════════════════════╝
-    | histogramme par bloc (512 symboles)
-    v
-+------------------------------------------------------+
-|  Phase B: CPU per-chunk tANS table construction      |
-|  Per chunk: Normalize -> Duda's spread -> Encode table|
-+------------------------------------------------------+
-    | SymInfo[512] + enc_table[1024] per chunk
-    v
-╔══════════════════════════════════════════════════════╗
-║  Phase C: Pass2 tANS encode (double-buffered batch)  ║
-║  for each mega-batch (32MB):                         ║
-║    ┌──────────────────────────────────────────────┐  ║
-║    │ Pass2: tans_encode (double-buffered batch)   │  ║
-║    │ 256 interleaved ANS streams per chunk        │  ║
-║    │ dispatch_semaphore -> serial write queue     │  ║
-║    └──────────────────────────────────────────────┘  ║
-╚══════════════════════════════════════════════════════╝
-    | 256 x bitstreams (async write overlap)
+╔═══════════════════════════════════════════════════════════╗
+║  Boucle streaming mega-batch (512 chunks = 32 Mo / batch) ║
+║  (Préchargement double tampon de Pass 1 inter-batches)    ║
+║                                                           ║
+║  1. GPU Pass 1 : compress_chunk                           ║
+║     ┌───────────────────────────────────────────────────┐ ║
+║     │ 1 threadgroup (128 threads) = 1 chunk (64 Ko)     │ ║
+║     │   A-1  Hash table init                            │ ║
+║     │   A-2  4-gram hash + Run-Skipping (atomic_min x2) │ ║
+║     │   A-3  LZ77 4-byte parallel match -> sparse[]     │ ║
+║     │   B    Parallel prefix-sum compaction -> compact[]│ ║
+║     └───────────────────────────────────────────────────┘ ║
+║                          |                                ║
+║                          v                                ║
+║  2. Construction des tables GPU : build_tans_tables       ║
+║     Per chunk: Histogram -> Normalize -> Spread -> EncTbl ║
+║                          | SymInfo[512] + enc_table[1024] ║
+║                          v                                ║
+║  3. GPU Pass 2 : tans_encode (double tampon, 32 ch/batch) ║
+║     128 flux ANS entrelacés par bloc                      ║
+║     addCompletedHandler -> serial write queue (tmp atom.) ║
+╚═══════════════════════════════════════════════════════════╝
+    | mise à jour de la seek table + rename atomique
     v
   .aplz file
 ```
@@ -59,70 +52,62 @@ mmap(input)  <- zero-copy MTLBuffer (Apple Silicon UMA)
 ### Pipeline de décompression (`-d`)
 
 ```
-read .aplz header + chunk_offsets (seek table)
+mmap(.aplz) -> lecture header + validation chunk_offsets (seek table)
     |
     v
-╔══════════════════════════════════════════════════════╗
-║  Mega-batch streaming pipeline (32MB buf_out)        ║
-║  for each mega-batch:                                ║
-║    ┌──────────────────────────────────────────────┐  ║
-║    │ Double-buffered batch pipeline               │  ║
-║    │                                              │  ║
-║    │ CPU (batch N+1):                             │  ║
-║    │   read per-chunk compact_freq + streams      │  ║
-║    │   build DecodeEntry[L] per chunk             │  ║
-║    │                                              │  ║
-║    │ GPU (batch N):                               │  ║
-║    │   tans_decode -> lz77_decode -> buf_out      │  ║
-║    └──────────────────────────────────────────────┘  ║
-║    -> fwrite(buf_out) -> reuse buffers               ║
-╚══════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════╗
+║  Pipeline streaming mega-batch (sortie 32 Mo double buf.) ║
+║  for each mega-batch:                                     ║
+║    ┌───────────────────────────────────────────────────┐  ║
+║    │ Pipeline par lots double tampon (32 chunks/batch) │  ║
+║    │                                                   │  ║
+║    │ CPU (batch N+1, parallèle via dispatch_apply) :   │  ║
+║    │   lecture compact_freq + 128 flux par bloc        │  ║
+║    │   construction de DecodeEntry[L] par bloc         │  ║
+║    │                                                   │  ║
+║    │ GPU (batch N, 128 threads/chunk) :                │  ║
+║    │   tans_decode -> lz77_decode -> mb_out[slot]      │  ║
+║    └───────────────────────────────────────────────────┘  ║
+║    -> fwrite asynchrone(mb_out[slot]) -> réutilisation    ║
+╚═══════════════════════════════════════════════════════════╝
     v
-  donnees originales restaurees
+  données originales restaurées
 ```
 
 ## Format de fichier (.aplz)
 
 | Offset | Taille | Contenu |
 |---|---|---|
-| 0 | 24 o | `FileHeader` (magic "APLZ", version=5, original_size, chunk_size, num_chunks) |
-| 24 | 4 o | `n_streams` = 256 |
+| 0 | 24 o | `FileHeader` (magic `"APLZ"`, `version = 3`, `original_size`, `chunk_size = 65536`, `num_chunks`) |
+| 24 | 4 o | `n_streams` = 128 |
 | 28 | 4 o | `ans_log_l` = 10 |
-| 32 | 8xN o | `chunk_offsets[N]` (seek table) |
-| ... | variable | Chunk data (N blocs, encodage v5) |
+| 32 | 8×N o | `chunk_offsets[N]` (seek table) |
+| ... | variable | Chunk data (N blocs, format v3) |
 
-Structure des donnees par bloc (encodage v5) :
-- `chunk_kind` (1 o) : 0 = encoded (tANS), 1 = raw (fallback)
-
-**Bloc encode (chunk_kind = 0) :**
-- `chunk_n_streams` (2 o) : nombre de flux ANS actifs pour ce bloc
+Structure des données par bloc (format v3) :
 - `token_cnt` (4 o) : nombre de tokens denses
-- `compact_freq` : `n_nonzero` (2 o) + `[sym_id, freq]` paires (4 o chaque) — symboles non nuls uniquement
-- `stream_sizes[chunk_n_streams]` (2 o chaque) : taille en octets de chaque flux ANS
-- stream data : flux de bits ANS concatenes avec **codage de distance compacte v5**
-  - Distance courte (≤255) : payload 8-bit + flag 1-bit
-  - Distance longue (>255) : payload 16-bit + flag 1-bit
+- `compact_freq` : `n_nonzero` (2 o) + paires `[sym_id, freq]` (4 o chaque) — symboles non nuls uniquement
+- `stream_sizes[128]` (2 o chaque = 256 o) : taille en octets de chaque flux ANS
+- stream data : flux de bits ANS concaténés (128 flux entrelacés ; chaque token de correspondance stocke une distance arrière de 16 bits)
 
-**Bloc brut (chunk_kind = 1) :**
-- `raw_size` (4 o) : taille du bloc non compresse
-- raw bytes : donnees originales (fallback quand la sortie encodee depasse l'entree)
+> Les fichiers vides (`original_size = 0`, `num_chunks = 0`) sont enregistrés uniquement avec un en-tête de 32 octets (`FileHeader` + `n_streams` + `ans_log_l`).
 
 ## Installation
 
-Necessite macOS + Xcode Command Line Tools.
+Nécessite macOS + Xcode Command Line Tools.
 
 ```bash
-# Installer dans ~/.local/bin (compilation optimisee avec -O3 -flto)
+# Installer dans ~/.local/bin (compilation optimisée avec -O3 -flto + metallib précompilé)
 ./install.sh
 
-# Installer dans /usr/local/bin (necessite sudo)
+# Installer dans /usr/local/bin (nécessite sudo)
 ./install.sh /usr/local
 
-# Desinstaller
+# Désinstaller
 ./install.sh uninstall
 ```
 
-### Integration Finder (optionnelle)
+### Intégration Finder (optionnelle)
 
 ```bash
 # Ajouter clic droit -> "Compress with APLZ" / "Extract with APLZ"
@@ -136,13 +121,13 @@ Compatible avec Google Drive et les fichiers de stockage cloud. Le service trait
 
 ## Utilisation
 
-### Commande aplz (recommandee)
+### Commande aplz (recommandée)
 
 ```bash
 # Compresser un fichier
 aplz compress myfile.txt              → myfile.txt.aplz
 
-# Compresser un repertoire (tar automatique)
+# Compresser un répertoire (tar automatique)
 aplz compress myproject/              → myproject.tar.aplz
 
 # Extraire
@@ -156,65 +141,68 @@ aplz info myfile.txt.aplz
 ### gpu_zip (API bas niveau)
 
 ```bash
-./gpu_zip -c <input> <output.aplz> compression.metal
-./gpu_zip -d <input.aplz> <output> compression.metal
+./gpu_zip -c <input> <output.aplz> compression.metal [--debug]
+./gpu_zip -d <input.aplz> <output> compression.metal [--debug]
 ```
 
-### Compilation de developpement
+> Si un fichier `compression.metallib` précompilé se trouve à côté de `compression.metal`, `gpu_zip` le charge automatiquement et se replie sinon sur la compilation à la volée.
+
+### Compilation de développement
 
 ```bash
-./build.sh        # compilation -O2
+./build.sh        # compilation -O2 (génère gpu_zip + compression.metallib)
 ./build.sh clean   # nettoyer les artefacts
 ```
 
 ## Performances (Apple M4)
 
+Mesuré avec le build release `-O3 -flto`, meilleur sur 3 exécutions (entrées de 512 Mo, round-trip exact vérifié) :
+
 ### Compression
 
-| Donnees | Entree | Sortie | Ratio | Debit |
+| Données | Entrée | Sortie | Ratio | Débit |
 |---|---|---|---|---|
-| Texte (motif repetitif) | 1 Mo | 31 Ko | 3.0% | 50 Mo/s |
-| Texte (volumineux) | 100 Mo | 3.0 Mo | 3.0% | 251 Mo/s |
-| Binaire aleatoire | 10 Mo | 10.6 Mo | 106% | 121 Mo/s |
+| Texte (motif répétitif) | 512 Mo | 10.3 Mo | 2.0% | 297 Mo/s |
+| Binaire aléatoire | 512 Mo | 535.9 Mo | 104.7% | 134 Mo/s |
 
-### Decompression
+### Décompression
 
-| Donnees | Vitesse | Notes |
-|---|---|---|
-| Texte (1 Mo) | 246 Mo/s | 1 mega-batch, overhead minimal du pipeline |
-| Texte (100 Mo) | 1.4 Go/s | 4 mega-batches, recouvrement complet du pipeline |
-| Aleatoire (10 Mo) | 246 Mo/s | 1 mega-batch, principalement des literaux |
+| Données | Entrée | Vitesse | Notes |
+|---|---|---|---|
+| Texte (motif répétitif) | 512 Mo | 2.6 Go/s | 16 mega-batches, recouvrement complet du pipeline |
+| Binaire aléatoire | 512 Mo | 232 Mo/s | 16 mega-batches, principalement des littéraux |
 
-> Les donnees aleatoires sont incompressibles, donc la sortie depasse legerement l'entree (overhead des champs tANS/distance).
-> L'utilisation memoire est constante (~512 Mo) quelle que soit la taille d'entree grace au streaming par mega-batch.
+> Les données aléatoires sont incompressibles, donc la sortie dépasse légèrement l'entrée (overhead des champs tANS/distance).
+> L'utilisation mémoire est constante quelle que soit la taille d'entrée grâce au streaming par mega-batch.
 
 ## Fichiers sources
 
-| Fichier | Role |
+| Fichier | Rôle |
 |---|---|
-| `APLZ.h` | Header partage (structs et constantes pour CPU et GPU) |
-| `compression.metal` | Kernels GPU (MSL 3.0) : compress_chunk, tans_encode, tans_decode, lz77_decode |
-| `main.mm` | Pilote hote (Objective-C++) : mega-batch O(1) + pipelines asynchrones a double tampon |
-| `aplz` | CLI wrapper utilisateur (Bash) : support fichiers/repertoires, integration tar |
-| `install.sh` | Installateur : compilation optimisee (-O3 -flto) + deploiement systeme |
-| `setup_finder.sh` | Generateur de Quick Actions macOS Finder (compression/extraction par clic droit) |
-| `build.sh` | Script de compilation de developpement |
+| `APLZ.h` | Header partagé (structs et constantes pour CPU et GPU) |
+| `compression.metal` | Kernels GPU (MSL 3.0) : `compress_chunk`, `build_tans_tables`, `tans_encode`, `tans_decode`, `lz77_decode` |
+| `main.mm` | Pilote hôte (Objective-C++) : mega-batch O(1) + pipelines asynchrones à double tampon |
+| `aplz` | CLI wrapper utilisateur (Bash) : support fichiers/répertoires, intégration tar |
+| `install.sh` | Installateur : compilation optimisée (`-O3 -flto` + `.metallib`) + déploiement système |
+| `setup_finder.sh` | Générateur de Quick Actions macOS Finder (compression/extraction par clic droit) |
+| `build.sh` | Script de compilation de développement |
+| `bench_compress.sh` | Script de benchmark comparant APLZ à gzip/zip/zstd/lz4/xz |
 
-## Details techniques
+## Détails techniques
 
-- **LZ77** : 3-gram hash, 2-way hash table (atomic_fetch_min), max match 255, min match 3, distance up to 65534
-- **Per-chunk tANS (v3)** : Construit dynamiquement des tables tANS optimales par bloc de 64 Ko. 512 symbols (256 literals + 256 match lengths), L=1024, Duda's fast spread. Threadgroup cooperative loading pour un acces rapide aux tables per-chunk sur GPU
-- **ANS Encoding** : Forward encode with renormalization, sentinel bit for bitstream end detection
-- **ANS Decoding** : Reverse playback from final state, sentinel via `clz()`, O(1) decode table lookup
-- **Compact Frequency Serialization** : Stocke uniquement les entrees non nulles par bloc (`n_nonzero + [sym_id, freq]` pairs), minimisant l'overhead de taille du fichier
-- **LZ77 Parallel Decode** : Hybrid approach — serial fallback for token count > 4096, parallel cooperative copy with barrier reduction for dense match streams
-- **Async Double Buffering** : GCD-based batch pipeline (32 chunks/batch, 2 slots). `dispatch_semaphore` for slot exclusion, `addCompletedHandler` + serial `dispatch_queue` for ordered async writes
-- **O(1) Streaming Memory** : Mega-batch architecture (512 chunks = 32MB per batch). Buffers are reused across mega-batches. Fixed ~512 MB memory regardless of input size.
+- **LZ77** : Hachage multiplicatif 4-grammes (`h4`), table de hachage 2-way (`atomic_fetch_min`) avec Run-Skipping, comparaison parallèle 4 octets, compactage parallel prefix-sum (`sparse` → `compact`), max match 255, min match 3, distance jusqu'à 65534
+- **Per-chunk tANS (v3)** : Construit dynamiquement des tables tANS optimales par bloc de 64 Ko sur GPU (`build_tans_tables`). 128 flux ANS entrelacés, 512 symboles (256 littéraux + 256 longueurs de correspondance), L=1024, Duda's fast spread et chargement coopératif en mémoire threadgroup
+- **ANS Encoding** : Encodage direct avec renormalisation, champs de distance 16 bits, bit sentinelle pour la fin de flux
+- **ANS Decoding** : Lecture inverse depuis l'état final, sentinelle via `clz()`, extraction de bits par mot, accès O(1) à la table de décodage et validation des bornes par bloc
+- **Compact Frequency Serialization** : Stocke uniquement les entrées non nulles par bloc (paires `n_nonzero + [sym_id, freq]`), minimisant l'overhead de taille du fichier
+- **Décodage LZ77 entièrement parallèle** : Prefix-scan parallèle par tuiles pour validation et littéraux, suivi d'une copie parallèle unifiée par modulo (`out[off - dist + (j % dist)]`) gérant correspondances chevauchantes et non chevauchantes sans repli séquentiel
+- **Async Double Buffering** : Pipeline par lots GCD (32 chunks/batch, 2 slots). `dispatch_semaphore` pour l'exclusion de slots, `dispatch_apply` pour la construction parallèle CPU des tables de décodage, `addCompletedHandler` + `dispatch_queue` série pour les écritures asynchrones ordonnées et renommage atomique en compression
+- **O(1) Streaming Memory** : Architecture mega-batch (512 chunks = 32 Mo par lot). Les tampons sont réutilisés d'un mega-batch à l'autre pour une mémoire constante
 
 ## Limitations connues
 
-- **BS_CAP = 512 o** : La sortie maximale d'un flux est de 512 octets. Les donnees hautement incompressibles peuvent tronquer des bits.
-- **Taille de bloc fixee a 64 Ko** : Configurable mais necessite une recompilation.
+- **BS_CAP = 1024 o** : La sortie maximale d'un flux est de 1024 octets. Les données incompressibles à expansion extrême peuvent tronquer des bits.
+- **Taille de bloc fixée à 64 Ko** : Configurable dans `APLZ.h` / `compression.metal`, mais nécessite une recompilation.
 
 ## License
 
