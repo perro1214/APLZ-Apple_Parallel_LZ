@@ -77,33 +77,38 @@ aplz d archive.aplz restored.bin
 
 ## Benchmarks (Apple M4, End-to-End File-to-File)
 
-All runs verified byte-for-byte with `cmp` / `dircmp`.
+Measured on Apple M4 (10-core CPU / 10-core GPU, UMA, macOS, `aplz` v4.0.0). All runs verified byte-for-byte with `cmp` / `dircmp`.
 
-### 1. Realistic Mixed Directory (979 files, 90.6 MiB: 3-snapshot repo + FP16 weights + FP32 telemetry + Mach-O)
+### 1. Realistic Mixed Directory (979 files, 89.4 MiB: 3-snapshot repo + 2-gen FP16 weights + FP32 telemetry + Mach-O)
 
 | Tool | Archive Size | Ratio | Pack | Full Extract | List | 1-File Extract |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **`aplz -1`** | **25.27 MB** | **26.6%** | **76.9 ms** | **262.4 ms** | **4.2 ms** | **4.73 ms** |
-| **`aplz -3`** | **24.60 MB** | **25.9%** | **81.8 ms** | **217.7 ms** | **4.1 ms** | **8.94 ms** |
-| `tar+zstd -1 -T0` | 53.52 MB | 56.4% | 385.0 ms | 500.6 ms | 69.1 ms | 68.02 ms |
-| `tar+zstd -3 -T0` | 50.40 MB | 53.1% | 399.6 ms | 467.2 ms | 70.2 ms | 80.58 ms |
-| `tar+lz4 -1` | 69.78 MB | 73.5% | 426.3 ms | 407.5 ms | 49.7 ms | 49.46 ms |
+| **`aplz -1`** | **12.39 MiB** | **13.9%** | **49.1 ms** | **76.0 ms** | **2.9 ms** | **3.23 ms** |
+| **`aplz -3`** | **12.32 MiB** | **13.8%** | **49.8 ms** | **76.3 ms** | **3.0 ms** | **3.19 ms** |
+| `tar+zstd -1 -T0` | 33.08 MiB | 37.0% | 346.5 ms | 364.3 ms | 47.0 ms | 46.17 ms |
+| `tar+zstd -3 -T0` | 32.39 MiB | 36.2% | 373.1 ms | 368.1 ms | 58.0 ms | 57.63 ms |
+| `tar+lz4 -1` | 47.97 MiB | 53.7% | 380.5 ms | 366.3 ms | 42.1 ms | 41.28 ms |
 
 ### 2. Large Single File — 1.00 GiB Heterogeneous (`FP32 + FP16 + Mach-O + Mixed`)
 
-| Tool | Ratio | Archive Size | Compress | Decompress | Verify / List |
-| :--- | ---: | ---: | ---: | ---: | :--- |
-| **`aplz -3`** | **37.58%** | **384.8 MiB** | **2,949 MB/s (0.35 s)** | **2,398 MB/s (0.43 s)** | Verify `0.39 s` / List `7.1 ms` |
-| `zstd -3 -T0` | 66.19% | 677.8 MiB | 2,248 MB/s (0.46 s) | 1,183 MB/s (0.87 s) | — |
+| Tool | Ratio | Archive Size | Compress | Decompress (`d`) | Extract (`x`) | Verify (`t`) / List (`l`) |
+| :--- | ---: | ---: | ---: | ---: | ---: | :--- |
+| **`aplz -1`** | **38.25%** | **391.6 MiB** | **3,010 MB/s (0.34 s)** | **3,450 MB/s (0.30 s)** | **3,192 MB/s (0.32 s)** | Verify `0.14 s` (7,066 MB/s) / List `4.6 ms` |
+| **`aplz -3`** | **37.55%** | **384.5 MiB** | **2,797 MB/s (0.37 s)** | **3,496 MB/s (0.29 s)** | **3,355 MB/s (0.31 s)** | Verify `0.15 s` (7,020 MB/s) / List `4.4 ms` |
+| `aplz -1 --no-dedup` | 58.11% | 595.1 MiB | 2,417 MB/s (0.42 s) | 3,290 MB/s (0.31 s) | 2,852 MB/s (0.36 s) | Verify `0.22 s` (4,692 MB/s) / List `4.1 ms` |
+| `zstd -3 -T0` | 66.20% | 677.9 MiB | 2,153 MB/s (0.48 s) | 1,204 MB/s (0.85 s) | — | — |
 
 ### 3. Single Files — 256 MiB (`aplz` vs `zstd -3 -T0` vs `lz4 -1`)
 
 | Dataset | `aplz -1` (Ratio / Comp / Dec) | `aplz -3` (Ratio / Comp / Dec) | `zstd -3 -T0` (Ratio / Comp / Dec) | `lz4 -1` (Ratio / Comp / Dec) |
 | :--- | :--- | :--- | :--- | :--- |
-| **Source+Docs** | **3.4%** / 3,722 / 3,689 MB/s | **3.2%** / 3,318 / **4,032 MB/s** | 0.2% / 9,140 / 5,482 MB/s | 36.6% / 1,082 / 1,654 MB/s |
-| **FP16 Weights** | **84.1%** / 2,096 / **3,372 MB/s** | **84.1%** / 2,035 / **2,442 MB/s** | 91.6% / 3,268 / 1,195 MB/s | 100.0% / 2,565 / 1,915 MB/s |
-| **FP32 Telemetry** | **41.0%** / **2,156** / **4,135 MB/s** | **38.3%** / **1,771** / **3,539 MB/s** | 75.5% / 1,279 / 1,008 MB/s | 99.9% / 1,551 / 1,608 MB/s |
-| **Mixed Real** | **48.6%** / **2,410** / **3,238 MB/s** | **48.5%** / **2,363** / **3,190 MB/s** | 57.9% / 1,853 / 1,589 MB/s | 73.5% / 1,016 / 1,098 MB/s |
+| **Source+Docs** | **3.0%** / 3,794 / 3,603 MB/s | **2.8%** / 3,650 / **3,826 MB/s** | 0.3% / 9,170 / 4,216 MB/s | 33.7% / 1,054 / 1,589 MB/s |
+| **Mach-O ARM64** | **1.9%** / **4,869** / **4,187 MB/s** | **1.8%** / **4,991** / **3,987 MB/s** | 39.8% / 1,792 / 1,184 MB/s | 57.4% / 719 / 1,439 MB/s |
+| **FP16 Weights** | **84.1%** / 1,840 / **3,542 MB/s** | **84.1%** / 2,105 / **3,596 MB/s** | 91.6% / 3,189 / 1,211 MB/s | 100.0% / 2,281 / 1,824 MB/s |
+| **FP32 Telemetry** | **41.0%** / **2,215** / **3,998 MB/s** | **38.3%** / **1,693** / **3,959 MB/s** | 75.5% / 1,193 / 1,023 MB/s | 99.9% / 1,530 / 1,759 MB/s |
+| **Mixed Real** | **48.5%** / 2,188 / **2,984 MB/s** | **48.4%** / 2,118 / **2,968 MB/s** | 57.9% / 2,933 / 1,867 MB/s | 72.7% / 1,082 / 1,747 MB/s |
+
+> **Tip**: For unique large numeric tensors without cross-chunk redundancy, `--no-dedup` bypasses FastCDC and streams 256 MiB packs directly (e.g., `FP16 Weights` up to **3,211 MB/s** compress / **3,905 MB/s** decompress, `FP32 Telemetry` up to **2,710 MB/s** compress / **3,748 MB/s** decompress).
 
 ---
 

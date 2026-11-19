@@ -163,8 +163,9 @@ Slot N   (Write Queue):[厳密順序保証・適応並列ゼロ中間コピー�
   - 入力 `< 96 MiB`（`HYBRID_GPU_MIN_BYTES` 未満）かつ Metal 未初期化時: Metal を起動せず、**CPU 全コア ブランチレス 32-way rANS**（`rans32_encode_tile_fast`）で 0 ms 起動遅延のまま処理する。`n_tiles > n_streams && n_streams < 64` の場合はタイル単位並列に自動切替する。
   - 入力 `>= 96 MiB` 時: 先頭スロットを CPU rANS で即座に処理開始しつつバックグラウンドスレッドで `ensure_gpu_encode()` を非同期実行し、完了したスロットから自動的に Metal GPU バッチ（`hx_rans_batch_build` + `hx_rans_batch_encode`）へ無停止切替する。
   - GPU エンコード／デコードとも、バッチごとの Metal コマンド投入を `@autoreleasepool` で囲み、GB 級ストリーミングでも Objective-C 一時オブジェクトが蓄積しない構造としている。
-- **2 スロット非同期 GPU デコード (`DEC_SLOTS = 2`)**:
-  - GPU デコード有効時、Slot `N+1` の GPU 32-way rANS 復号（`hx_rans_batch_decode`）を非同期投入しながら、CPU 全コアで Slot `N` の LZ 展開 + NEON 逆前処理 + HW CRC32C 検証を実行する。これにより Apple Silicon GPU の DVFS クロック低下を防ぎつつ CPU/GPU を完全並列化する。
+- **ゼロコピー ARM64 NEON 並列デコード & 2 スロット非同期 GPU デコード (`DEC_SLOTS = 2`, `OUT_WR_SLOTS = 3`)**:
+  - 単発 CLI 復号では、非アライン 16-bit ロード対応のゼロコピー 32-way NEON 復号（`rans32_decode_tile_neon_bytes`）＋タイル単位マルチコア並列展開＋3 スロット非同期ファイル書出（`OUT_WR_SLOTS = 3`）により、Metal 起動遅延と中間コピーをゼロ化する。
+  - 常駐 GPU デコード有効時は、Slot `N+1` の GPU 32-way rANS 復号（`hx_rans_batch_decode`）を非同期投入しながら、CPU 全コアで Slot `N` の LZ 展開 + NEON 逆前処理 + HW CRC32C 検証を実行し、CPU/GPU を完全並列化する。
 
 ### 3.2 適応前処理（OpenZL 型軽量 DAG）とプローブ
 
@@ -274,7 +275,7 @@ Phase 3（`src/archive/`）は、一時 `.tar` ファイルを完全に廃止し
 | ファイル規模 | 格納方式 | パック上限 | 狙い |
 |---|---|---|---|
 | **小ファイル (`< 64 KiB`)** | **5 クラス型別 Solid Grouping** | `4 MiB` (`ASZ_SOLID_PACK_MAX`) | 類似コンテンツを連続結合してクロスファイル LZ 圧縮率を劇的に向上させつつ、部分展開時の復号上限を 4 MiB に抑える |
-| **大ファイル (`>= 64 KiB`)** | **並列正規化 FastCDC 重複排除 + 連続スパン直圧縮** | `64 MiB` (`ASZ_LARGE_PACK_MAX`) | 同一・類似チャンクを 1 回のみ格納。重複のない連続ユニークチャンク列はコピーせず `mmap` 領域から直接 `ASZ2` パックへストリーミング圧縮 |
+| **大ファイル (`>= 64 KiB`)** | **並列正規化 FastCDC 重複排除 + 連続スパン直圧縮** | `128 MiB` (`ASZ_LARGE_PACK_MAX`) / `256 MiB` (`ASZ_STREAM_PACK_MAX`, `--no-dedup`) | 同一・類似チャンクを 1 回のみ格納。重複のない連続ユニークチャンク列はコピーせず `mmap` 領域から直接 `ASZ2` パックへストリーミング圧縮（`--no-dedup` 時は FastCDC を省略し 256 MiB 単位で直圧縮） |
 
 #### 5 クラス型分類（`asz_classify_file`）
 先頭マジックバイト → 拡張子 → 先頭 256 B の制御文字比率の順で高速分類する。
@@ -323,7 +324,7 @@ Phase 3（`src/archive/`）は、一時 `.tar` ファイルを完全に廃止し
   [AszPackDesc × num_packs] (各 32 B)
     uint64_t file_offset
     uint64_t comp_size
-    uint32_t raw_size           // <= 64 MiB
+    uint32_t raw_size           // <= 128 MiB (FastCDC) / <= 256 MiB (--no-dedup)
     uint32_t pack_crc32c
     uint8_t  solid_class        // ASZ_CLASS_*
     uint8_t  is_solid           // 1=Solid Pack, 0=Large FastCDC Pack
@@ -366,9 +367,10 @@ Phase 3（`src/archive/`）は、一時 `.tar` ファイルを完全に廃止し
 
 1. **O(1) 一覧表示 (`aplz l`)**: `AszFileHeader` (40 B) と末尾の `Central Directory` のみを読んで表示するため、GB 級アーカイブでも数ミリ秒で完了する。
 2. **256 KiB ブロック単位 O(1) 部分展開 (`aplz x archive.aplz -C out <path>`)**:
-   - 指定ファイルが参照する Extent の `(pack_id, offset_in_pack, length)` のみを抽出し、`HeteroEngine::decompress_range` で該当 256 KiB ブロックだけを選択復号する（例: 64 MiB パック内の 128 KiB ファイルなら 1 ブロック = 256 KiB のみ復号、0.3 ms 未満）。
-3. **パック順序最適化 & 2 スロット LRU キャッシュ**:
-   - 全展開 (`extract`) および検証 (`verify`) では、対象ファイルを `(first_pack_id, offset_in_pack)` 順にソートしてから展開するため、マルチクラスアーカイブでも各パックの復号回数は厳密に 1 回で済む。
+   - 指定ファイルが参照する Extent の `(pack_id, offset_in_pack, length)` のみを抽出し、`HeteroEngine::decompress_range` で該当 256 KiB ブロックだけを選択復号する（例: 128 MiB パック内の 128 KiB ファイルでも 1 ブロック = 256 KiB のみ復号、0.3 ms 未満）。
+3. **パック順序最適化・並列ファイル書出・ゼロバッファ直展開**:
+   - 全展開 (`extract`) および検証 (`verify`) では、対象ファイルを `(first_pack_id, offset_in_pack)` 順にソートし、同一 Pack 内の複数ファイル（Solid Pack 等）は全 CPU コア並列で `open(O_EXCL|O_NOFOLLOW)` + `fchmod` + `futimens` 書出を行う。
+   - 非共有の連続大パックでは、`extract` / `extract_single_file` 双方で APFS `F_PREALLOCATE` + 3 スロット非同期ストリーミング直書出を行い、`verify` でも出力バッファ確保ゼロのストリーミング検証を実行する。
 4. **3 重破損検知 (`aplz t` / 展開時自動検証)**:
    - Layer 1: `AszFileHeader.header_crc32c` + `Central Directory` の `ASZ2` ブロック CRC32C
    - Layer 2: 各パックの `AszPackDesc.pack_crc32c`（圧縮ストリーム全体の破損検知）+ `HxBlockHeader.crc32c` + rANS 32 レーン終端状態厳密検証
@@ -385,20 +387,22 @@ Phase 3（`src/archive/`）は、一時 `.tar` ファイルを完全に廃止し
 
 ### 5.1 1.00 GiB 異種混合単一ファイル（FP32 + FP16 + Mach-O + Mixed、エンドツーエンド CLI）
 
-| ツール | 圧縮後サイズ (圧縮率) | 圧縮速度 (時間) | 解凍速度 (時間) | 整合性検査 (`t`) | 一覧 (`l`) |
-|---|---:|---:|---:|---:|---:|
-| **`aplz -3` (default)** | **384.8 MiB (37.58%)** | **2,949 MB/s (0.35 s)** | **2,398 MB/s (0.43 s)** | 0.39 s | 7.1 ms |
-| `aplz -1` (fast) | 392.0 MiB (38.28%) | 793 MB/s (初回コールド) | 2,000 MB/s (0.51 s) | 0.57 s | 8.4 ms |
-| `zstd -3 -T0` | 677.8 MiB (66.19%) | 2,248 MB/s (0.46 s) | 1,183 MB/s (0.87 s) | — | — |
+| ツール | 圧縮後サイズ (圧縮率) | 圧縮速度 (時間) | 解凍 `d` (時間) | 展開 `x` (時間) | 整合性検査 (`t`) | 一覧 (`l`) |
+|---|---:|---:|---:|---:|---:|---:|
+| **`aplz -1` (fast)** | **391.6 MiB (38.25%)** | **3,010 MB/s (0.34 s)** | **3,450 MB/s (0.30 s)** | **3,192 MB/s (0.32 s)** | **0.14 s** (7,066 MB/s) | **4.6 ms** |
+| **`aplz -3` (default)** | **384.5 MiB (37.55%)** | **2,797 MB/s (0.37 s)** | **3,496 MB/s (0.29 s)** | **3,355 MB/s (0.31 s)** | **0.15 s** (7,020 MB/s) | **4.4 ms** |
+| `aplz -1 --no-dedup` | 595.1 MiB (58.11%) | 2,417 MB/s (0.42 s) | 3,290 MB/s (0.31 s) | 2,852 MB/s (0.36 s) | 0.22 s (4,692 MB/s) | 4.1 ms |
+| `zstd -3 -T0` | 677.9 MiB (66.20%) | 2,153 MB/s (0.48 s) | 1,204 MB/s (0.85 s) | — | — | — |
 
-### 5.2 979 ファイル実ディレクトリ（`ml_project`, 90.6 MiB、エンドツーエンド CLI）
+### 5.2 979 ファイル実ディレクトリ（`ml_project`, 89.4 MiB、エンドツーエンド CLI）
 
 | ツール | アーカイブサイズ (比率) | 作成 (Pack) | 全展開 (Full) | 一覧 (List) | 1 ファイル部分展開 |
 |---|---:|---:|---:|---:|---:|
-| **`aplz -3`** | **24.60 MB (25.9%)** | **81.8 ms** | **217.7 ms** | **4.1 ms** | **8.94 ms** |
-| **`aplz -1`** | **25.27 MB (26.6%)** | **76.9 ms** | 262.4 ms | **4.2 ms** | **4.73 ms** |
-| `tar + zstd -3 -T0` | 50.40 MB (53.1%) | 399.6 ms | 467.2 ms | 70.2 ms | 80.58 ms |
-| `tar + lz4 -1` | 69.78 MB (73.5%) | 426.3 ms | 407.5 ms | 49.7 ms | 49.46 ms |
+| **`aplz -1`** | **12.39 MiB (13.9%)** | **49.1 ms** | **76.0 ms** | **2.9 ms** | **3.23 ms** |
+| **`aplz -3`** | **12.32 MiB (13.8%)** | **49.8 ms** | **76.3 ms** | **3.0 ms** | **3.19 ms** |
+| `tar + zstd -1 -T0` | 33.08 MiB (37.0%) | 346.5 ms | 364.3 ms | 47.0 ms | 46.17 ms |
+| `tar + zstd -3 -T0` | 32.39 MiB (36.2%) | 373.1 ms | 368.1 ms | 58.0 ms | 57.63 ms |
+| `tar + lz4 -1` | 47.97 MiB (53.7%) | 380.5 ms | 366.3 ms | 42.1 ms | 41.28 ms |
 
 ### 5.3 Phase 2 コア（64 MiB インメモリ、定常スループット）
 
