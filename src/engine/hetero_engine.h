@@ -127,8 +127,8 @@ public:
     static const uint32_t MAX_STREAMS_MB = MB_BLOCKS * 4u;              // 最大 128 ストリーム/スロット
     static const uint32_t MAX_TILES_MB   = MB_BLOCKS * 7u;              // 最大 224 タイル/スロット
     static const uint32_t STREAM_BUF_CAP = MB_BYTES + MB_BLOCKS * 65536u; // 10 MiB
-    // 単発 CLI 起動時、これ以上のサイズなら非同期 Metal 初期化を起動して GPU へ自動切替
-    static const size_t   HYBRID_GPU_MIN_BYTES = 96ull * 1024ull * 1024ull;
+    // 単発 CLI 起動時、Metal コールドスタート(~70ms)を十分回収できるサイズ以上でのみ非同期 Metal 初期化を起動
+    static const size_t   HYBRID_GPU_MIN_BYTES = 384ull * 1024ull * 1024ull;
 
     struct BlockPlan {
         uint32_t raw_size;
@@ -262,7 +262,8 @@ public:
         return true;
     }
 
-    // 大ファイル圧縮向けに非同期で Metal GPU エンコード初期化を先行起動する
+    // 大ファイル圧縮向けに非同期 Metal GPU エンコード初期化を先行起動
+    // (QOS_CLASS_USER_INITIATED で CPU 飽和中も餓死させず確実に初期化完了 → GPU 3 スロットへ自動切替!)
     void warmup_gpu_encode_async() {
         if (force_cpu_rans || gpu_enc_ready_atomic.load(std::memory_order_acquire)) return;
         bool expected = false;
@@ -274,7 +275,7 @@ public:
         }
     }
 
-    // 大ファイル解凍向けに非同期で Metal GPU デコード初期化を先行起動する (0ms コールドスタート!)
+    // 大ファイル解凍向けに非同期 Metal GPU デコード初期化を先行起動
     void warmup_gpu_decode_async() {
         if (force_cpu_rans || gpu_dec_ready_atomic.load(std::memory_order_acquire)) return;
         bool expected = false;
@@ -440,10 +441,8 @@ public:
         dispatch_queue_t     write_q    = dispatch_queue_create("aplzx.enc.write", DISPATCH_QUEUE_SERIAL);
         dispatch_semaphore_t slot_sem   = dispatch_semaphore_create(N_SLOTS);
         dispatch_group_t     done_grp   = dispatch_group_create();
-        dispatch_group_t     ginit_grp  = dispatch_group_create();
-        bool                 ginit_sent = false;
 
-        // 大ファイル初回起動時: 先頭/中央ブロックの超高速プローブで圧縮対象なら非同期 Metal 初期化を先行開始!
+        // 大ファイル初回起動時: 先頭/中央ブロックの超高速プローブで圧縮対象なら非同期 Metal 初期化を 1 回だけ先行開始!
         // → Batch 0..k は待ちゼロで CPU 32-way rANS が処理し、初期化完了の瞬間から GPU へ自動移行!
         if (!force_cpu_rans && !gpu_enc_ready_atomic.load(std::memory_order_acquire) && in_size >= HYBRID_GPU_MIN_BYTES) {
             uint32_t b0_len = (uint32_t)std::min((size_t)HX_BLOCK_SIZE, in_size);
@@ -453,11 +452,7 @@ public:
             HxProbeResult pm = hx_probe_block(in_data + mid_off, bm_len);
             if (p0.codec_hint == HX_CODEC_LZ_RANS || p0.codec_hint == HX_CODEC_RANS_ONLY ||
                 pm.codec_hint == HX_CODEC_LZ_RANS || pm.codec_hint == HX_CODEC_RANS_ONLY) {
-                ginit_sent = true;
-                HeteroEngine* self_ptr = this;
-                dispatch_group_async(ginit_grp, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                    self_ptr->ensure_gpu_encode();
-                });
+                warmup_gpu_encode_async();
             }
         }
 
@@ -627,13 +622,9 @@ public:
             uint8_t* extra_dst_base = (extra_cursor > 0u) ? slot.extra_pool.data() : nullptr;
 
             // 大ファイルで先頭が RAW だった場合も、最初の圧縮バッチで非同期 Metal 初期化を起動
-            if (n_streams > 0u && !force_cpu_rans && !ginit_sent &&
+            if (n_streams > 0u && !force_cpu_rans &&
                 !gpu_enc_ready_atomic.load(std::memory_order_acquire) && in_size >= HYBRID_GPU_MIN_BYTES) {
-                ginit_sent = true;
-                HeteroEngine* self_ptr = this;
-                dispatch_group_async(ginit_grp, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                    self_ptr->ensure_gpu_encode();
-                });
+                warmup_gpu_encode_async();
             }
 
             // ── Stage 4b: Apple GPU 非同期投入 OR CPU 全コア ブランチレス 32-way rANS ─
@@ -732,14 +723,19 @@ public:
                                 ttasks[cj[si].first_tile_idx + t] = { (uint16_t)si, (uint16_t)t };
                             }
                         }
+                        std::vector<Rans32CpuFastSym> fast_syms((size_t)n_streams * HX_N_SYMBOLS);
+                        Rans32CpuFastSym* fs_pool = fast_syms.data();
                         dispatch_apply(n_streams, par_q, ^(size_t si) {
                             HxRansStreamJob& sj = cj[si];
                             Rans32BlockMeta bm;
-                            rans32_cpu_build_tables_fast(sbuf + sj.data_offset, sj.raw_size,
-                                                         csym + si * HX_N_SYMBOLS, &bm);
+                            Rans32EncSym* my_sym = csym + si * HX_N_SYMBOLS;
+                            rans32_cpu_build_tables_fast(sbuf + sj.data_offset, sj.raw_size, my_sym, &bm);
                             sj.mode      = bm.mode;
                             sj.rle_byte  = bm.rle_byte;
                             sj.n_nonzero = bm.n_nonzero;
+                            if (bm.mode == HX_SUB_RANS) {
+                                rans32_build_fast_enc_sym(my_sym, fs_pool + si * HX_N_SYMBOLS);
+                            }
                         });
                         const TileTask* tt_ptr = ttasks;
                         dispatch_apply(n_tiles, par_q, ^(size_t tgid) {
@@ -753,11 +749,11 @@ public:
                             } else if (sj.mode == HX_SUB_RAW || tlen < HX_MIN_RANS_LEN) {
                                 ctm[tgid] = { HX_SUB_RAW, 0u, tlen, tlen };
                             } else {
-                                rans32_encode_tile_fast(sbuf + sj.data_offset + loff, tlen,
-                                                        csym + (size_t)si * HX_N_SYMBOLS,
-                                                        cw + tgid * HX_TILE_MAX_WORDS,
-                                                        cfs + tgid * HX_LANES,
-                                                        &ctm[tgid]);
+                                rans32_encode_tile_fast_with_table(sbuf + sj.data_offset + loff, tlen,
+                                                                   fs_pool + (size_t)si * HX_N_SYMBOLS,
+                                                                   cw + (size_t)tgid * HX_TILE_MAX_WORDS,
+                                                                   cfs + (size_t)tgid * HX_LANES,
+                                                                   &ctm[tgid]);
                             }
                         });
                     } else {
@@ -771,6 +767,10 @@ public:
                             sj.rle_byte  = bm.rle_byte;
                             sj.n_nonzero = bm.n_nonzero;
 
+                            Rans32CpuFastSym fsym[HX_N_SYMBOLS];
+                            if (bm.mode == HX_SUB_RANS) {
+                                rans32_build_fast_enc_sym(my_sym, fsym);
+                            }
                             for (uint32_t t = 0u; t < sj.num_tiles; ++t) {
                                 uint32_t tgid = sj.first_tile_idx + t;
                                 uint32_t loff = t * HX_TILE_SIZE;
@@ -780,10 +780,10 @@ public:
                                 } else if (bm.mode == HX_SUB_RAW || tlen < HX_MIN_RANS_LEN) {
                                     ctm[tgid] = { HX_SUB_RAW, 0u, tlen, tlen };
                                 } else {
-                                    rans32_encode_tile_fast(sdata + loff, tlen, my_sym,
-                                                            cw + (size_t)tgid * HX_TILE_MAX_WORDS,
-                                                            cfs + (size_t)tgid * HX_LANES,
-                                                            &ctm[tgid]);
+                                    rans32_encode_tile_fast_with_table(sdata + loff, tlen, fsym,
+                                                                       cw + (size_t)tgid * HX_TILE_MAX_WORDS,
+                                                                       cfs + (size_t)tgid * HX_LANES,
+                                                                       &ctm[tgid]);
                                 }
                             }
                         });
@@ -1011,11 +1011,6 @@ public:
         dispatch_group_wait(done_grp, DISPATCH_TIME_FOREVER);
         st.pack_s += CACurrentMediaTime() - td0;
 
-        // 非同期 Metal 初期化が進行中ならオブジェクト破棄前に安全に合流
-        if (ginit_sent) {
-            dispatch_group_wait(ginit_grp, DISPATCH_TIME_FOREVER);
-        }
-
         if (pipe_failed) return false;
 
         // シークテーブルを先頭 (file_base_off + sizeof(hdr)) へ書き戻し、末尾へ戻す
@@ -1160,14 +1155,17 @@ public:
                                           ? hx_get_thread_lz_state().acquire_xtmp()
                                           : final_dst;
                     const uint8_t* ex_ptr = dp.extra_ptr;
-                    std::vector<uint8_t> ex_pad;
-                    if ((size_t)((in_archive + in_size) - ex_ptr) < (size_t)dp.extra_bytes + 8u) {
-                        ex_pad.resize((size_t)dp.extra_bytes + 8u, 0u);
+                    bool lz_ok;
+                    if (__builtin_expect((size_t)((in_archive + in_size) - ex_ptr) >= (size_t)dp.extra_bytes + 8u, 1)) {
+                        lz_ok = hx_lz_decode_block(dp.lm, dp.s_ptr[0], dp.s_ptr[1], dp.s_ptr[2], dp.s_ptr[3],
+                                                   ex_ptr, dp.extra_bytes, lz_dst, dp.bh.raw_size);
+                    } else {
+                        std::vector<uint8_t> ex_pad((size_t)dp.extra_bytes + 8u, 0u);
                         if (dp.extra_bytes > 0u) memcpy(ex_pad.data(), ex_ptr, dp.extra_bytes);
-                        ex_ptr = ex_pad.data();
+                        lz_ok = hx_lz_decode_block(dp.lm, dp.s_ptr[0], dp.s_ptr[1], dp.s_ptr[2], dp.s_ptr[3],
+                                                   ex_pad.data(), dp.extra_bytes, lz_dst, dp.bh.raw_size);
                     }
-                    if (!hx_lz_decode_block(dp.lm, dp.s_ptr[0], dp.s_ptr[1], dp.s_ptr[2], dp.s_ptr[3],
-                                            ex_ptr, dp.extra_bytes, lz_dst, dp.bh.raw_size)) {
+                    if (!lz_ok) {
                         ok = false;
                         return;
                     }
@@ -1538,11 +1536,13 @@ public:
             uint32_t*        lut_ptr = nullptr;
             uint8_t*         dec_s   = nullptr;
 
-            auto ensure_cpu_dec_bufs = [&]() {
+            auto ensure_cpu_dec_stream_buf = [&]() {
                 if (!dec_s) {
                     cpu_dec_stream_buf.ensure(STREAM_BUF_CAP);
                     dec_s = cpu_dec_stream_buf.data();
                 }
+            };
+            auto ensure_cpu_dec_lut_buf = [&]() {
                 if (!lut_ptr) {
                     cpu_dec_lut_buf.ensure((size_t)MAX_STREAMS_MB * HX_PROB_SCALE * sizeof(uint32_t));
                     lut_ptr = (uint32_t*)cpu_dec_lut_buf.data();
@@ -1556,6 +1556,8 @@ public:
 
             struct FreqTask { uint32_t sidx; const uint8_t* p; const uint8_t* end; };
             FreqTask freq_tasks[MAX_STREAMS_MB];
+            const uint8_t* freq_p_by_s[MAX_STREAMS_MB];
+            const uint8_t* freq_end_by_s[MAX_STREAMS_MB];
             uint32_t n_freq = 0u;
 
             auto parse_substream = [&](const uint8_t*& p, const uint8_t* end,
@@ -1572,8 +1574,10 @@ public:
                     p += expected_len;
                     return true;
                 }
-                ensure_cpu_dec_bufs();
+                ensure_cpu_dec_stream_buf();
                 uint32_t idx = n_streams++;
+                freq_p_by_s[idx]   = nullptr;
+                freq_end_by_s[idx] = nullptr;
                 uint32_t exp_nt = (expected_len + HX_TILE_SIZE - 1u) / HX_TILE_SIZE;
                 out_sidx = (int32_t)idx;
                 out_ptr  = dec_s + cur_off;
@@ -1590,6 +1594,8 @@ public:
                     size_t fbytes = 2u + ((fkind == HX_FREQ_SPARSE) ? ((size_t)n_nz * 3u) : 384u);
                     if ((size_t)(end - p) < fbytes) return false;
                     freq_tasks[n_freq++] = { idx, p, p + fbytes };
+                    freq_p_by_s[idx]     = p;
+                    freq_end_by_s[idx]   = p + fbytes;
                     p += fbytes;
 
                     if ((size_t)(end - p) < (size_t)ntiles * sizeof(Rans32TileDiskDesc)) return false;
@@ -1681,58 +1687,77 @@ public:
                 }
             }
 
-            __block bool freq_ok = true;
-            if (n_freq > 0u) {
-                const FreqTask* ft_arr = freq_tasks;
-                dispatch_apply(n_freq, par_q, ^(size_t i) {
-                    const uint8_t* fp = ft_arr[i].p;
-                    if (!rans32_read_freq_table_to_lut(fp, ft_arr[i].end,
-                                                       lut_ptr + (size_t)ft_arr[i].sidx * HX_PROB_SCALE)) {
-                        freq_ok = false;
-                    }
-                });
-            }
-            st.pack_s += CACurrentMediaTime() - tp0;
-            if (!freq_ok) return fail_cleanup();
-
-            CFTimeInterval tr0 = CACurrentMediaTime();
-            if (total_rans_bytes > 0u) {
-                __block bool neon_ok = true;
-                if (n_tiles > n_streams && n_streams < 64u) {
-                    struct DecTileTask { uint32_t si; uint32_t local_t; };
-                    DecTileTask dtasks[MAX_TILES_MB];
-                    uint32_t nt_idx = 0u;
-                    for (uint32_t si = 0u; si < n_streams; ++si) {
-                        for (uint32_t t = 0u; t < sjobs[si].num_tiles; ++t) {
-                            dtasks[nt_idx++] = { si, t };
-                        }
-                    }
-                    const DecTileTask* dt_ptr = dtasks;
-                    dispatch_apply(nt_idx, par_q, ^(size_t k) {
-                        uint32_t si = dt_ptr[k].si;
-                        uint32_t t  = dt_ptr[k].local_t;
-                        const HxRansStreamJob& sj = sjobs[si];
-                        if (sj.mode != HX_SUB_RANS) return;
-                        uint32_t tgid = sj.first_tile_idx + t;
-                        uint8_t* dst = dec_s + sj.data_offset + t * HX_TILE_SIZE;
-                        const CpuTileRef& tr = trefs[tgid];
-                        if (tr.mode == HX_SUB_RLE) {
-                            memset(dst, (int)tr.rle_byte, tr.raw_size);
-                        } else if (tr.mode == HX_SUB_RANS) {
-                            uint32_t fstates[HX_LANES];
-                            memcpy(fstates, tr.ptr, sizeof(fstates));
-                            if (!rans32_decode_tile_neon_bytes(tr.ptr + sizeof(fstates), tr.word_count,
-                                                               fstates, lut_ptr + (size_t)si * HX_PROB_SCALE,
-                                                               dst, tr.raw_size)) {
-                                neon_ok = false;
-                            }
+            const bool use_tile_parallel = (total_rans_bytes > 0u && n_tiles > n_streams && n_streams < 64u);
+            if (use_tile_parallel) {
+                // タイル並列パス (FP16 32ストリーム×2タイル等): 共有 LUT 構築 → タイル粒度並列復号
+                __block bool freq_ok = true;
+                if (n_freq > 0u) {
+                    ensure_cpu_dec_lut_buf();
+                    const FreqTask* ft_arr = freq_tasks;
+                    uint32_t* lptr = lut_ptr;
+                    dispatch_apply(n_freq, par_q, ^(size_t i) {
+                        const uint8_t* fp = ft_arr[i].p;
+                        if (!rans32_read_freq_table_to_lut(fp, ft_arr[i].end,
+                                                           lptr + (size_t)ft_arr[i].sidx * HX_PROB_SCALE)) {
+                            freq_ok = false;
                         }
                     });
-                } else {
+                }
+                st.pack_s += CACurrentMediaTime() - tp0;
+                if (!freq_ok) return fail_cleanup();
+
+                CFTimeInterval tr0 = CACurrentMediaTime();
+                __block bool neon_ok = true;
+                struct DecTileTask { uint32_t si; uint32_t local_t; };
+                DecTileTask dtasks[MAX_TILES_MB];
+                uint32_t nt_idx = 0u;
+                for (uint32_t si = 0u; si < n_streams; ++si) {
+                    for (uint32_t t = 0u; t < sjobs[si].num_tiles; ++t) {
+                        dtasks[nt_idx++] = { si, t };
+                    }
+                }
+                const DecTileTask* dt_ptr = dtasks;
+                uint32_t* lptr = lut_ptr;
+                dispatch_apply(nt_idx, par_q, ^(size_t k) {
+                    uint32_t si = dt_ptr[k].si;
+                    uint32_t t  = dt_ptr[k].local_t;
+                    const HxRansStreamJob& sj = sjobs[si];
+                    if (sj.mode != HX_SUB_RANS) return;
+                    uint32_t tgid = sj.first_tile_idx + t;
+                    uint8_t* dst = dec_s + sj.data_offset + t * HX_TILE_SIZE;
+                    const CpuTileRef& tr = trefs[tgid];
+                    if (tr.mode == HX_SUB_RLE) {
+                        memset(dst, (int)tr.rle_byte, tr.raw_size);
+                    } else if (tr.mode == HX_SUB_RANS) {
+                        uint32_t fstates[HX_LANES];
+                        memcpy(fstates, tr.ptr, sizeof(fstates));
+                        if (!rans32_decode_tile_neon_bytes(tr.ptr + sizeof(fstates), tr.word_count,
+                                                           fstates, lptr + (size_t)si * HX_PROB_SCALE,
+                                                           dst, tr.raw_size)) {
+                            neon_ok = false;
+                        }
+                    }
+                });
+                st.rans_s += CACurrentMediaTime() - tr0;
+                if (!neon_ok) return fail_cleanup();
+            } else {
+                // ストリーム融合パス (LZ 全データ等): L1D ローカル 16 KB LUT 構築 → 即デコード!
+                // (2 MiB LUT バッファ確保・L2 退避再読出・dispatch_apply バリア 1 回を完全排除!)
+                st.pack_s += CACurrentMediaTime() - tp0;
+                CFTimeInterval tr0 = CACurrentMediaTime();
+                if (n_freq > 0u || total_rans_bytes > 0u) {
+                    __block bool dec_stream_ok = true;
+                    const uint8_t* const* fp_arr   = freq_p_by_s;
+                    const uint8_t* const* fend_arr = freq_end_by_s;
                     dispatch_apply(n_streams, par_q, ^(size_t si) {
                         const HxRansStreamJob& sj = sjobs[si];
                         if (sj.mode != HX_SUB_RANS) return;
-                        const uint32_t* lut = lut_ptr + si * HX_PROB_SCALE;
+                        uint32_t local_lut[HX_PROB_SCALE];
+                        const uint8_t* fp = fp_arr[si];
+                        if (!fp || !rans32_read_freq_table_to_lut(fp, fend_arr[si], local_lut)) {
+                            dec_stream_ok = false;
+                            return;
+                        }
                         for (uint32_t t = 0u; t < sj.num_tiles; ++t) {
                             uint32_t tgid = sj.first_tile_idx + t;
                             uint8_t* dst = dec_s + sj.data_offset + t * HX_TILE_SIZE;
@@ -1743,16 +1768,17 @@ public:
                                 uint32_t fstates[HX_LANES];
                                 memcpy(fstates, tr.ptr, sizeof(fstates));
                                 if (!rans32_decode_tile_neon_bytes(tr.ptr + sizeof(fstates), tr.word_count,
-                                                                   fstates, lut, dst, tr.raw_size)) {
-                                    neon_ok = false;
+                                                                   fstates, local_lut, dst, tr.raw_size)) {
+                                    dec_stream_ok = false;
+                                    return;
                                 }
                             }
                         }
                     });
+                    if (!dec_stream_ok) return fail_cleanup();
                 }
-                if (!neon_ok) return fail_cleanup();
+                st.rans_s += CACurrentMediaTime() - tr0;
             }
-            st.rans_s += CACurrentMediaTime() - tr0;
 
             CFTimeInterval tlz0 = CACurrentMediaTime();
             bool dec_ok = decode_blocks_cpu(dplans, bc, batch_dst_base);
@@ -1903,16 +1929,8 @@ public:
                         if ((size_t)(send - sp) < need) return false;
                         uint32_t fstates[HX_LANES];
                         memcpy(fstates, sp, sizeof(fstates));
-                        const uint8_t* wp_raw = sp + sizeof(fstates);
-                        bool tok = false;
-                        if (((uintptr_t)wp_raw & 1u) == 0u) {
-                            tok = rans32_decode_tile_neon((const uint16_t*)wp_raw, wc, fstates, lut.data(), tdst, tlen);
-                        } else {
-                            std::vector<uint16_t> wtmp(wc);
-                            memcpy(wtmp.data(), wp_raw, (size_t)wc * sizeof(uint16_t));
-                            tok = rans32_decode_tile_neon(wtmp.data(), wc, fstates, lut.data(), tdst, tlen);
-                        }
-                        if (!tok) return false;
+                        if (!rans32_decode_tile_neon_bytes(sp + sizeof(fstates), wc, fstates, lut.data(), tdst, tlen))
+                            return false;
                         sp += need;
                     } else {
                         return false;

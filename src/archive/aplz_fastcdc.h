@@ -141,12 +141,21 @@ static inline uint32_t asz_fastcdc_next_cut(const uint8_t* __restrict data, size
     uint64_t fp = 0ULL;
     uint32_t i  = ASZ_CDC_MIN_SIZE;
 
-    // 厳格マスク区間 [16 KiB, 64 KiB) — 4 バイト展開で分岐回数を 1/4 化
+    // 厳格マスク区間 [16 KiB, 64 KiB) — 32-bit 一括ロード + 並列加算木 (ループ依存 1 命令・ビット完全一致!)
+    // 恒等式 (mod 2^64): ((((fp<<1)+g0)<<1)+g1)<<2 + ((g2<<1)+g3) == (fp<<4) + (((g0<<1)+g1)<<2) + ((g2<<1)+g3)
     for (; i + 4u <= norm_lim; i += 4u) {
-        uint64_t fp1 = (fp  << 1u) + gear[data[i + 0u]];
-        uint64_t fp2 = (fp1 << 1u) + gear[data[i + 1u]];
-        uint64_t fp3 = (fp2 << 1u) + gear[data[i + 2u]];
-        uint64_t fp4 = (fp3 << 1u) + gear[data[i + 3u]];
+        uint32_t w;
+        memcpy(&w, data + i, 4u);
+        uint64_t g0  = gear[ w         & 0xFFu];
+        uint64_t g1  = gear[(w >>  8u) & 0xFFu];
+        uint64_t g2  = gear[(w >> 16u) & 0xFFu];
+        uint64_t g3  = gear[(w >> 24u) & 0xFFu];
+        uint64_t t01 = (g0 << 1u) + g1;
+        uint64_t t23 = (g2 << 1u) + g3;
+        uint64_t fp1 = (fp << 1u) + g0;
+        uint64_t fp2 = (fp << 2u) + t01;
+        uint64_t fp3 = (fp2 << 1u) + g2;
+        uint64_t fp4 = (fp << 4u) + ((t01 << 2u) + t23);
         if (__builtin_expect(((fp1 & ASZ_CDC_MASK_S) == 0ULL) |
                              ((fp2 & ASZ_CDC_MASK_S) == 0ULL) |
                              ((fp3 & ASZ_CDC_MASK_S) == 0ULL) |
@@ -163,12 +172,20 @@ static inline uint32_t asz_fastcdc_next_cut(const uint8_t* __restrict data, size
         if (__builtin_expect((fp & ASZ_CDC_MASK_S) == 0ULL, 0)) return i + 1u;
     }
 
-    // 緩和マスク区間 [64 KiB, 256 KiB) — 4 バイト展開
+    // 緩和マスク区間 [64 KiB, 256 KiB) — 32-bit 一括ロード + 並列加算木
     for (; i + 4u <= max_lim; i += 4u) {
-        uint64_t fp1 = (fp  << 1u) + gear[data[i + 0u]];
-        uint64_t fp2 = (fp1 << 1u) + gear[data[i + 1u]];
-        uint64_t fp3 = (fp2 << 1u) + gear[data[i + 2u]];
-        uint64_t fp4 = (fp3 << 1u) + gear[data[i + 3u]];
+        uint32_t w;
+        memcpy(&w, data + i, 4u);
+        uint64_t g0  = gear[ w         & 0xFFu];
+        uint64_t g1  = gear[(w >>  8u) & 0xFFu];
+        uint64_t g2  = gear[(w >> 16u) & 0xFFu];
+        uint64_t g3  = gear[(w >> 24u) & 0xFFu];
+        uint64_t t01 = (g0 << 1u) + g1;
+        uint64_t t23 = (g2 << 1u) + g3;
+        uint64_t fp1 = (fp << 1u) + g0;
+        uint64_t fp2 = (fp << 2u) + t01;
+        uint64_t fp3 = (fp2 << 1u) + g2;
+        uint64_t fp4 = (fp << 4u) + ((t01 << 2u) + t23);
         if (__builtin_expect(((fp1 & ASZ_CDC_MASK_L) == 0ULL) |
                              ((fp2 & ASZ_CDC_MASK_L) == 0ULL) |
                              ((fp3 & ASZ_CDC_MASK_L) == 0ULL) |
@@ -220,7 +237,7 @@ static inline void asz_fastcdc_chunk_and_hash(
         return;
     }
 
-    // 大ファイル (>= 8 MiB): 8 MiB スーパースライスごとに全コア並列 FastCDC → 20+ GB/s!
+    // 大ファイル (>= 16 MiB): 8 MiB スーパースライス単位で全コア並列 FastCDC (境界ロス最小 & 32 スライス並列)
     const size_t SLICE_BYTES = 8ull * 1024ull * 1024ull;
     if (size >= SLICE_BYTES * 2u) {
         size_t n_slices = (size + SLICE_BYTES - 1u) / SLICE_BYTES;

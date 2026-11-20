@@ -1115,6 +1115,10 @@ public:
         AszExtractStats stats;
         stats.used_partial = use_partial;
 
+        // 現在の umask を 1 回だけ取得 (99% の通常権限 0644/0755 で fchmod syscall を完全省略!)
+        mode_t cur_umask = umask(0);
+        umask(cur_umask);
+
         dispatch_queue_t par_q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
 
         // フル展開用 2 スロット Pack LRU キャッシュ (重複排除済みチャンクの多重参照で 100% ヒット!)
@@ -1296,7 +1300,8 @@ public:
                 }
                 size_t group_cnt = fj - fi;
 
-                // Path 2B: 複数ファイル (Solid Pack 等) → Pack を 1 回復号して全コア並列書出!
+                // Path 2B: 複数ファイル (Solid Pack 等) → Pack を 1 回復号し、APFS 最適な 4 ワーカー並列書出!
+                // (10 スレッド同時 open は同一ディレクトリ vnode ロック競合を起こすため 4 ワーカーに制限)
                 if (group_cnt >= 2u && pid0 != UINT32_MAX) {
                     const std::vector<uint8_t>* pdata = nullptr;
                     if (pid0 != UINT32_MAX - 1u) {
@@ -1309,50 +1314,59 @@ public:
                     const std::string*  od_p  = &out_dir;
                     std::atomic<int> first_err{-1};
                     std::atomic<uint64_t> batch_bytes{0u};
+                    std::atomic<size_t> next_k{0u};
                     std::atomic<int>* first_err_p = &first_err;
                     std::atomic<uint64_t>* batch_bytes_p = &batch_bytes;
+                    std::atomic<size_t>* next_k_p = &next_k;
+                    const size_t n_workers = std::min((size_t)4u, group_cnt);
 
-                    dispatch_apply(group_cnt, par_q, ^(size_t k) {
-                        if (first_err_p->load(std::memory_order_relaxed) >= 0) return;
-                        uint32_t eidx = grp_ptr[k];
-                        const AszEntryDesc& en = dir_p->entries[eidx];
-                        std::string rel  = dir_p->entry_path(en);
-                        std::string full = *od_p + "/" + rel;
+                    dispatch_apply(n_workers, par_q, ^(size_t /*w*/) {
+                        while (true) {
+                            if (first_err_p->load(std::memory_order_relaxed) >= 0) return;
+                            size_t k = next_k_p->fetch_add(1u, std::memory_order_relaxed);
+                            if (k >= group_cnt) break;
 
-                        int ofd = asz_open_create_safe(full.c_str(), 0600);
-                        if (ofd < 0) {
-                            int exp = -1; first_err_p->compare_exchange_strong(exp, (int)eidx);
-                            return;
-                        }
-                        if (en.raw_size >= 256u * 1024u) hx_preallocate_fd(ofd, en.raw_size);
+                            uint32_t eidx = grp_ptr[k];
+                            const AszEntryDesc& en = dir_p->entries[eidx];
+                            std::string rel  = dir_p->entry_path(en);
+                            std::string full = *od_p + "/" + rel;
+                            mode_t want_mode = (mode_t)(en.mode & 0777u);
 
-                        uint32_t crc_st = asz_crc32c_init();
-                        uint64_t written = 0u;
-                        bool lok = true;
-                        for (uint32_t ei = 0u; ei < en.num_extents; ++ei) {
-                            const AszExtentDesc& ex = dir_p->extents[en.first_extent + ei];
-                            const AszChunkDesc&  ch = dir_p->chunks[ex.chunk_id];
-                            const uint8_t* ptr = pack_bytes + ch.offset_in_pack + ex.offset_in_chunk;
-                            crc_st = asz_crc32c_update(crc_st, ptr, ex.length);
-                            if (ex.length > 0u && !hx_write_all_fd(ofd, ptr, ex.length)) {
-                                lok = false; break;
+                            int ofd = asz_open_create_safe(full.c_str(), want_mode);
+                            if (ofd < 0) {
+                                int exp = -1; first_err_p->compare_exchange_strong(exp, (int)eidx);
+                                return;
                             }
-                            written += ex.length;
+                            if (en.raw_size >= 256u * 1024u) hx_preallocate_fd(ofd, en.raw_size);
+
+                            uint32_t crc_st = asz_crc32c_init();
+                            uint64_t written = 0u;
+                            bool lok = true;
+                            for (uint32_t ei = 0u; ei < en.num_extents; ++ei) {
+                                const AszExtentDesc& ex = dir_p->extents[en.first_extent + ei];
+                                const AszChunkDesc&  ch = dir_p->chunks[ex.chunk_id];
+                                const uint8_t* ptr = pack_bytes + ch.offset_in_pack + ex.offset_in_chunk;
+                                crc_st = asz_crc32c_update(crc_st, ptr, ex.length);
+                                if (ex.length > 0u && !hx_write_all_fd(ofd, ptr, ex.length)) {
+                                    lok = false; break;
+                                }
+                                written += ex.length;
+                            }
+                            if (lok && (written != en.raw_size || asz_crc32c_final(crc_st) != en.file_crc32c)) {
+                                lok = false;
+                            }
+                            if (lok) {
+                                if ((want_mode & cur_umask) != 0u) fchmod(ofd, want_mode);
+                                asz_set_mtime_ns_fd(ofd, en.mtime_ns);
+                            }
+                            if (close(ofd) != 0) lok = false;
+                            if (!lok) {
+                                unlink(full.c_str());
+                                int exp = -1; first_err_p->compare_exchange_strong(exp, (int)eidx);
+                                return;
+                            }
+                            batch_bytes_p->fetch_add(written, std::memory_order_relaxed);
                         }
-                        if (lok && (written != en.raw_size || asz_crc32c_final(crc_st) != en.file_crc32c)) {
-                            lok = false;
-                        }
-                        if (lok) {
-                            fchmod(ofd, en.mode & 0777u);
-                            asz_set_mtime_ns_fd(ofd, en.mtime_ns);
-                        }
-                        if (close(ofd) != 0) lok = false;
-                        if (!lok) {
-                            unlink(full.c_str());
-                            int exp = -1; first_err_p->compare_exchange_strong(exp, (int)eidx);
-                            return;
-                        }
-                        batch_bytes_p->fetch_add(written, std::memory_order_relaxed);
                     });
 
                     int eidx = first_err.load();
@@ -1423,15 +1437,25 @@ public:
 
                     const std::vector<uint8_t>* pdata = get_decoded_pack(pid);
                     if (!pdata) { ok = false; break; }
-                    const uint8_t* ptr = pdata->data() + ch0.offset_in_pack + ex0.offset_in_chunk;
-                    uint32_t ecrc = (ex0.offset_in_chunk == 0u && ex0.length == ch0.raw_size)
-                                        ? ch0.crc32c : hx_crc32c(ptr, ex0.length);
-                    file_crc = hx_crc32c_combine(file_crc, ecrc, ex0.length);
-                    if (ex0.length > 0u && fwrite(ptr, 1, ex0.length, fout) != ex0.length) {
+                    // 同一 Pack 内の物理連続 Extent 群をラン結合して 1 回のゼロコピー書出へ統合!
+                    const uint32_t run_start_off = ch0.offset_in_pack + ex0.offset_in_chunk;
+                    uint64_t run_len = 0u;
+                    while (ei < en.num_extents) {
+                        const AszExtentDesc& ex = dir.extents[en.first_extent + ei];
+                        const AszChunkDesc&  ch = dir.chunks[ex.chunk_id];
+                        if (ch.pack_id != pid || (uint64_t)ch.offset_in_pack + ex.offset_in_chunk != (uint64_t)run_start_off + run_len)
+                            break;
+                        const uint8_t* ptr = pdata->data() + ch.offset_in_pack + ex.offset_in_chunk;
+                        uint32_t ecrc = (ex.offset_in_chunk == 0u && ex.length == ch.raw_size)
+                                            ? ch.crc32c : hx_crc32c(ptr, ex.length);
+                        file_crc = hx_crc32c_combine(file_crc, ecrc, ex.length);
+                        run_len += ex.length;
+                        ei++;
+                    }
+                    if (run_len > 0u && fwrite(pdata->data() + run_start_off, 1, (size_t)run_len, fout) != (size_t)run_len) {
                         last_error = "File write failed: " + full; ok = false; break;
                     }
-                    written += ex0.length;
-                    ei++;
+                    written += run_len;
                 }
 
                 if (ok) {
@@ -1596,7 +1620,7 @@ public:
                             last_error = "Streaming pack decompression failed";
                             ok = false; break;
                         }
-                        if (sz >= 128ull * 1024ull * 1024ull) {
+                        if (sz >= 2048ull * 1024ull * 1024ull) {
                             asz_madvise_dontneed(mapped, (size_t)pk.file_offset, (size_t)(pk.file_offset + pk.comp_size));
                         }
                         stats.packs_decoded++;
@@ -1610,16 +1634,25 @@ public:
 
             const std::vector<uint8_t>* pdata = get_pack(pid);
             if (!pdata) { ok = false; break; }
-            const uint8_t* ptr = pdata->data() + ch0.offset_in_pack + ex0.offset_in_chunk;
-            // Pack は全ブロック CRC 検証済みなのでチャンク全体一致時は ch0.crc32c を即座に GF(2) 結合 (単スレッド再走査ゼロ!)
-            uint32_t ecrc = (ex0.offset_in_chunk == 0u && ex0.length == ch0.raw_size)
-                                ? ch0.crc32c : hx_crc32c(ptr, ex0.length);
-            file_crc = hx_crc32c_combine(file_crc, ecrc, ex0.length);
-            if (ex0.length > 0u && fwrite(ptr, 1, ex0.length, fout) != ex0.length) {
+            // 同一 Pack 内の物理連続 Extent 群をラン結合して 1 回のゼロコピー大ブロック書出へ統合!
+            const uint32_t run_start_off = ch0.offset_in_pack + ex0.offset_in_chunk;
+            uint64_t run_len = 0u;
+            while (ei < en.num_extents) {
+                const AszExtentDesc& ex = dir.extents[en.first_extent + ei];
+                const AszChunkDesc&  ch = dir.chunks[ex.chunk_id];
+                if (ch.pack_id != pid || (uint64_t)ch.offset_in_pack + ex.offset_in_chunk != (uint64_t)run_start_off + run_len)
+                    break;
+                const uint8_t* ptr = pdata->data() + ch.offset_in_pack + ex.offset_in_chunk;
+                uint32_t ecrc = (ex.offset_in_chunk == 0u && ex.length == ch.raw_size)
+                                    ? ch.crc32c : hx_crc32c(ptr, ex.length);
+                file_crc = hx_crc32c_combine(file_crc, ecrc, ex.length);
+                run_len += ex.length;
+                ei++;
+            }
+            if (run_len > 0u && fwrite(pdata->data() + run_start_off, 1, (size_t)run_len, fout) != (size_t)run_len) {
                 last_error = "Write failed"; ok = false; break;
             }
-            written += ex0.length;
-            ei++;
+            written += run_len;
         }
         if (fclose(fout) != 0) ok = false;
         munmap(m, sz);

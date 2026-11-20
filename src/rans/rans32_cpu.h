@@ -191,11 +191,28 @@ static inline bool rans32_read_freq_table_to_lut(
     }
 
     uint32_t sum = 0;
+#if defined(__aarch64__)
+    const uint32x4_t v_init_off = { 0u, 1u << 20u, 2u << 20u, 3u << 20u };
+    const uint32x4_t v_step4    = vdupq_n_u32(4u << 20u);
+#endif
     for (uint32_t s = 0; s < RANS32_N_SYMBOLS; ++s) {
         uint16_t f = freq[s];
+        if (f == 0u) continue;
         if (sum + f > RANS32_PROB_SCALE) return false;
-        for (uint32_t bias = 0; bias < f; ++bias) {
-            out_dec_lut[sum + bias] = rans32_pack_lut(s, f, bias);
+        uint32_t base_val = (s & 0xFFu) | (((uint32_t)f & RANS32_PROB_MASK) << 8u);
+        uint32_t* dst_lut = out_dec_lut + sum;
+        uint32_t bias = 0u;
+#if defined(__aarch64__)
+        if (f >= 4u) {
+            uint32x4_t v = vaddq_u32(vdupq_n_u32(base_val), v_init_off);
+            for (; bias + 4u <= f; bias += 4u) {
+                vst1q_u32(dst_lut + bias, v);
+                v = vaddq_u32(v, v_step4);
+            }
+        }
+#endif
+        for (; bias < f; ++bias) {
+            dst_lut[bias] = base_val | (bias << 20u);
         }
         sum += f;
     }
@@ -369,13 +386,41 @@ static inline void rans32_cpu_build_tables_fast(
     }
 }
 
-static inline void rans32_encode_tile_fast(
-    const uint8_t*      __restrict tile_in,
-    uint32_t                       tile_len,
+// CPU エンコード専用 16B テーブル (64-bit 1 乗算 + 固定シフト >>44 + madd で全 f=1..4095 厳密一致!)
+// 証明: 再正規化後 x < f * 2^20 かつ f <= 4095 に対し M = ceil(2^44 / f) は
+//       x * M < 2^64 (オーバーフローゼロ) かつ floor(x * M / 2^44) == floor(x / f) が恒等成立。
+struct Rans32CpuFastSym {
+    uint64_t rcp64; // ceil(2^44 / f)
+    uint32_t x_max; // f << 20
+    uint16_t step;  // 4096 - f  → (q << 12) + cdf + (x - q * f) == (x + cdf) + q * step
+    uint16_t cdf;
+};
+static_assert(sizeof(Rans32CpuFastSym) == 16, "Rans32CpuFastSym must be 16B");
+
+static inline void rans32_build_fast_enc_sym(
     const Rans32EncSym* __restrict enc_sym,
-    uint16_t*           __restrict out_words,        // [RANS32_TILE_MAX_WORDS]
-    uint32_t*           __restrict out_final_states, // [32]
-    Rans32TileMeta*                out_meta
+    Rans32CpuFastSym*   __restrict out_fast
+) {
+    for (uint32_t s = 0u; s < RANS32_N_SYMBOLS; ++s) {
+        uint32_t f = enc_sym[s].freq;
+        if (f > 0u) {
+            out_fast[s].rcp64 = ((1ULL << 44u) + (uint64_t)f - 1ULL) / (uint64_t)f;
+            out_fast[s].x_max = enc_sym[s].x_max;
+            out_fast[s].step  = (uint16_t)(RANS32_PROB_SCALE - f);
+            out_fast[s].cdf   = enc_sym[s].cdf;
+        } else {
+            out_fast[s] = { 0ULL, 0u, 0u, 0u };
+        }
+    }
+}
+
+static inline void rans32_encode_tile_fast_with_table(
+    const uint8_t*          __restrict tile_in,
+    uint32_t                           tile_len,
+    const Rans32CpuFastSym* __restrict fsym,
+    uint16_t*               __restrict out_words,        // [RANS32_TILE_MAX_WORDS]
+    uint32_t*               __restrict out_final_states, // [32]
+    Rans32TileMeta*                    out_meta
 ) {
     if (tile_len < RANS32_MIN_RANS_LEN) {
         out_meta->mode = RANS32_MODE_RAW;
@@ -401,18 +446,14 @@ static inline void rans32_encode_tile_fast(
         uint16_t step_words[RANS32_LANES];
         uint32_t cnt = 0u;
         for (uint32_t l = 0u; l < rem; ++l) {
-            const Rans32EncSym es = enc_sym[tile_in[base + l]];
+            const Rans32CpuFastSym e = fsym[tile_in[base + l]];
             uint32_t x = st[l];
-            uint32_t ren = (x >= es.x_max);
+            uint32_t ren = (x >= e.x_max);
             step_words[cnt] = (uint16_t)x;
             cnt += ren;
             x >>= (ren << 4u);
-            uint32_t f = es.freq;
-            uint32_t t = (uint32_t)(((uint64_t)x * (uint64_t)es.rcp_mul) >> 32u);
-            uint32_t q_div = (t + ((x - t) >> 1u)) >> es.rcp_shift;
-            uint32_t q = (f == 1u) ? x : q_div;
-            uint32_t r = x - q * f;
-            st[l] = (q << RANS32_PROB_BITS) + (uint32_t)es.cdf + r;
+            uint32_t q = (uint32_t)(((uint64_t)x * e.rcp64) >> 44u);
+            st[l] = (x + (uint32_t)e.cdf) + q * (uint32_t)e.step;
         }
         if (wp + cnt > max_words) {
             out_meta->mode = RANS32_MODE_RAW;
@@ -426,17 +467,16 @@ static inline void rans32_encode_tile_fast(
         step--;
     }
 
-    // フル 32 レーン・メインループ: 4 レーン並列 ILP + プレフィクス加算ブランチレス直書き
-    // (32 レーン直列の dst_w 依存チェーンを 1/4 に短縮し、Apple M4 の 4 ALU + 2 MUL を飽和!)
+    // フル 32 レーン・メインループ: 4 レーン並列 ILP + 64-bit 1 乗算 + madd (分岐ゼロ!)
     for (; step >= 0; --step) {
         const uint8_t* p = tile_in + ((uint32_t)step << 5u);
         if (__builtin_expect(wp + RANS32_LANES <= max_words, 1)) {
             uint16_t* dst_w = out_words + wp;
             for (uint32_t l = 0u; l < RANS32_LANES; l += 4u) {
-                const Rans32EncSym e0 = enc_sym[p[l + 0u]];
-                const Rans32EncSym e1 = enc_sym[p[l + 1u]];
-                const Rans32EncSym e2 = enc_sym[p[l + 2u]];
-                const Rans32EncSym e3 = enc_sym[p[l + 3u]];
+                const Rans32CpuFastSym e0 = fsym[p[l + 0u]];
+                const Rans32CpuFastSym e1 = fsym[p[l + 1u]];
+                const Rans32CpuFastSym e2 = fsym[p[l + 2u]];
+                const Rans32CpuFastSym e3 = fsym[p[l + 3u]];
 
                 uint32_t x0 = st[l + 0u];
                 uint32_t x1 = st[l + 1u];
@@ -464,39 +504,29 @@ static inline void rans32_encode_tile_fast(
                 x2 >>= (r2 << 4u);
                 x3 >>= (r3 << 4u);
 
-                uint32_t f0 = e0.freq, f1 = e1.freq, f2 = e2.freq, f3 = e3.freq;
-                uint32_t t0 = (uint32_t)(((uint64_t)x0 * (uint64_t)e0.rcp_mul) >> 32u);
-                uint32_t t1 = (uint32_t)(((uint64_t)x1 * (uint64_t)e1.rcp_mul) >> 32u);
-                uint32_t t2 = (uint32_t)(((uint64_t)x2 * (uint64_t)e2.rcp_mul) >> 32u);
-                uint32_t t3 = (uint32_t)(((uint64_t)x3 * (uint64_t)e3.rcp_mul) >> 32u);
+                uint32_t q0 = (uint32_t)(((uint64_t)x0 * e0.rcp64) >> 44u);
+                uint32_t q1 = (uint32_t)(((uint64_t)x1 * e1.rcp64) >> 44u);
+                uint32_t q2 = (uint32_t)(((uint64_t)x2 * e2.rcp64) >> 44u);
+                uint32_t q3 = (uint32_t)(((uint64_t)x3 * e3.rcp64) >> 44u);
 
-                uint32_t q0 = (f0 == 1u) ? x0 : ((t0 + ((x0 - t0) >> 1u)) >> e0.rcp_shift);
-                uint32_t q1 = (f1 == 1u) ? x1 : ((t1 + ((x1 - t1) >> 1u)) >> e1.rcp_shift);
-                uint32_t q2 = (f2 == 1u) ? x2 : ((t2 + ((x2 - t2) >> 1u)) >> e2.rcp_shift);
-                uint32_t q3 = (f3 == 1u) ? x3 : ((t3 + ((x3 - t3) >> 1u)) >> e3.rcp_shift);
-
-                st[l + 0u] = (q0 << RANS32_PROB_BITS) + (uint32_t)e0.cdf + (x0 - q0 * f0);
-                st[l + 1u] = (q1 << RANS32_PROB_BITS) + (uint32_t)e1.cdf + (x1 - q1 * f1);
-                st[l + 2u] = (q2 << RANS32_PROB_BITS) + (uint32_t)e2.cdf + (x2 - q2 * f2);
-                st[l + 3u] = (q3 << RANS32_PROB_BITS) + (uint32_t)e3.cdf + (x3 - q3 * f3);
+                st[l + 0u] = (x0 + (uint32_t)e0.cdf) + q0 * (uint32_t)e0.step;
+                st[l + 1u] = (x1 + (uint32_t)e1.cdf) + q1 * (uint32_t)e1.step;
+                st[l + 2u] = (x2 + (uint32_t)e2.cdf) + q2 * (uint32_t)e2.step;
+                st[l + 3u] = (x3 + (uint32_t)e3.cdf) + q3 * (uint32_t)e3.step;
             }
             wp = (uint32_t)(dst_w - out_words);
         } else {
             uint16_t step_words[RANS32_LANES];
             uint32_t cnt = 0u;
             for (uint32_t l = 0u; l < RANS32_LANES; ++l) {
-                const Rans32EncSym es = enc_sym[p[l]];
+                const Rans32CpuFastSym e = fsym[p[l]];
                 uint32_t x = st[l];
-                uint32_t ren = (x >= es.x_max);
+                uint32_t ren = (x >= e.x_max);
                 step_words[cnt] = (uint16_t)x;
                 cnt += ren;
                 x >>= (ren << 4u);
-                uint32_t f = es.freq;
-                uint32_t t = (uint32_t)(((uint64_t)x * (uint64_t)es.rcp_mul) >> 32u);
-                uint32_t q_div = (t + ((x - t) >> 1u)) >> es.rcp_shift;
-                uint32_t q = (f == 1u) ? x : q_div;
-                uint32_t r = x - q * f;
-                st[l] = (q << RANS32_PROB_BITS) + (uint32_t)es.cdf + r;
+                uint32_t q = (uint32_t)(((uint64_t)x * e.rcp64) >> 44u);
+                st[l] = (x + (uint32_t)e.cdf) + q * (uint32_t)e.step;
             }
             if (wp + cnt > max_words) {
                 out_meta->mode = RANS32_MODE_RAW;
@@ -515,6 +545,26 @@ static inline void rans32_encode_tile_fast(
     out_meta->rle_byte = 0u;
     out_meta->raw_size = tile_len;
     out_meta->word_count = wp;
+}
+
+static inline void rans32_encode_tile_fast(
+    const uint8_t*      __restrict tile_in,
+    uint32_t                       tile_len,
+    const Rans32EncSym* __restrict enc_sym,
+    uint16_t*           __restrict out_words,        // [RANS32_TILE_MAX_WORDS]
+    uint32_t*           __restrict out_final_states, // [32]
+    Rans32TileMeta*                out_meta
+) {
+    if (tile_len < RANS32_MIN_RANS_LEN) {
+        out_meta->mode = RANS32_MODE_RAW;
+        out_meta->rle_byte = 0u;
+        out_meta->raw_size = tile_len;
+        out_meta->word_count = tile_len;
+        return;
+    }
+    Rans32CpuFastSym fsym[RANS32_N_SYMBOLS];
+    rans32_build_fast_enc_sym(enc_sym, fsym);
+    rans32_encode_tile_fast_with_table(tile_in, tile_len, fsym, out_words, out_final_states, out_meta);
 }
 
 // ─── 4. Scalar リファレンス デコーダ (厳密オラクル) ────────────────────────────
@@ -576,10 +626,10 @@ static inline uint16_t rans32_load_u16_ua(const uint8_t* p) {
     return v;
 }
 
-// ─── 5. ARM64 NEON 32-way レジスタ常駐・ブランチレス高速デコーダ (ゼロコピー非アライン対応) ─
-// Apple Silicon の 32 本の 128-bit NEON レジスタを活かし、
-// 32 レーンの rANS 状態を 8 本の uint32x4_t (v0..v7) に常駐させてスタックスピルを排除。
-// 8 グループ並列の独立バイトポインタ + 完全ブランチレス補充で奇数アドレスもコピーゼロ展開!
+// ─── 5. ARM64 NEON 32-way レジスタ常駐 + vqtbl1q_u8 全 NEON 並列補充デコーダ ─────
+// ・32 レーンの rANS 状態を 8 本の uint32x4_t (v0..v7) に常駐 (スタックスピル 0 回!)
+// ・Pass 2 の 4 レーン補充は 1 グループ 1 回の 8B ロード (vld1_u8) + vqtbl1q_u8 (1 命令 tbl)
+//   + shl/orr/bsl で 100% NEON レジスタ内に完結 (NEON↔GPR 転送 64 回・分岐を完全撤廃!)
 static inline bool rans32_decode_tile_neon_bytes(
     const uint8_t*  __restrict words_bytes,
     uint32_t                   word_count,
@@ -593,8 +643,29 @@ static inline bool rans32_decode_tile_neon_bytes(
     if (word_count > 0u) memcpy(wtmp.data(), words_bytes, (size_t)word_count * 2u);
     return rans32_decode_tile_scalar(wtmp.data(), word_count, final_states, dec_lut, out_tile, tile_len);
 #else
+    alignas(16) static constexpr uint8_t SHUF_TBL[16][16] = {
+        { 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF }, // 0000
+        { 0,   1,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF }, // 0001
+        { 0xFF,0xFF,0xFF,0xFF, 0,   1,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF }, // 0010
+        { 0,   1,   0xFF,0xFF, 2,   3,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF }, // 0011
+        { 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0,   1,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF }, // 0100
+        { 0,   1,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 2,   3,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF }, // 0101
+        { 0xFF,0xFF,0xFF,0xFF, 0,   1,   0xFF,0xFF, 2,   3,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF }, // 0110
+        { 0,   1,   0xFF,0xFF, 2,   3,   0xFF,0xFF, 4,   5,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF }, // 0111
+        { 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0,   1,   0xFF,0xFF }, // 1000
+        { 0,   1,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 2,   3,   0xFF,0xFF }, // 1001
+        { 0xFF,0xFF,0xFF,0xFF, 0,   1,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 2,   3,   0xFF,0xFF }, // 1010
+        { 0,   1,   0xFF,0xFF, 2,   3,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 4,   5,   0xFF,0xFF }, // 1011
+        { 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 0,   1,   0xFF,0xFF, 2,   3,   0xFF,0xFF }, // 1100
+        { 0,   1,   0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF, 2,   3,   0xFF,0xFF, 4,   5,   0xFF,0xFF }, // 1101
+        { 0xFF,0xFF,0xFF,0xFF, 0,   1,   0xFF,0xFF, 2,   3,   0xFF,0xFF, 4,   5,   0xFF,0xFF }, // 1110
+        { 0,   1,   0xFF,0xFF, 2,   3,   0xFF,0xFF, 4,   5,   0xFF,0xFF, 6,   7,   0xFF,0xFF }, // 1111
+    };
+    static constexpr uint8_t CNT4[16] = { 0,1,1,2, 1,2,2,3, 1,2,2,3, 2,3,3,4 };
+
     const uint32x4_t v_rans_l = vdupq_n_u32(RANS32_L);
     const uint32x4_t v_mask12 = vdupq_n_u32(RANS32_PROB_MASK);
+    const uint32x4_t v_bitw   = { 1u, 2u, 4u, 8u };
 
     uint32x4_t st0 = vld1q_u32(final_states +  0);
     uint32x4_t st1 = vld1q_u32(final_states +  4);
@@ -615,7 +686,7 @@ static inline bool rans32_decode_tile_neon_bytes(
     uint32_t rp = word_count;
     const uint32_t full_steps = tile_len >> 5u;
 
-    #define RANS32_NEON_STEP_GROUP(ST, OUT_PTR, NEED_VEC)                       \
+    #define RANS32_NEON_STEP_GROUP(ST, OUT_PTR, LT_VEC, MASK4)                  \
         uint32x4_t _idx_##ST = vandq_u32(ST, v_mask12);                         \
         uint32_t _e0_##ST = dec_lut[vgetq_lane_u32(_idx_##ST, 0)];              \
         uint32_t _e1_##ST = dec_lut[vgetq_lane_u32(_idx_##ST, 1)];              \
@@ -630,31 +701,17 @@ static inline bool rans32_decode_tile_neon_bytes(
         uint32x4_t _frq_##ST = vandq_u32(vshrq_n_u32(_ent_##ST, 8), v_mask12);  \
         uint32x4_t _bia_##ST = vshrq_n_u32(_ent_##ST, 20);                      \
         ST = vmlaq_u32(_bia_##ST, _frq_##ST, vshrq_n_u32(ST, 12));              \
-        uint32x4_t NEED_VEC = vshrq_n_u32(vcltq_u32(ST, v_rans_l), 31)
+        uint32x4_t LT_VEC = vcltq_u32(ST, v_rans_l);                            \
+        uint32_t   MASK4  = vaddvq_u32(vandq_u32(LT_VEC, v_bitw))
 
-    #define RANS32_BRANCHLESS_REFILL4(ST, P)                                    \
+    #define RANS32_NEON_TBL_REFILL4(ST, LT_VEC, MASK4, P)                       \
         do {                                                                    \
-            uint32_t _s0 = vgetq_lane_u32(ST, 0);                               \
-            uint32_t _n0 = (_s0 < RANS32_L);                                    \
-            uint32_t _w0 = rans32_load_u16_ua(P);                               \
-            _s0 = _n0 ? ((_s0 << 16u) | _w0) : _s0;                             \
-            (P) += (_n0 << 1u);                                                 \
-            uint32_t _s1 = vgetq_lane_u32(ST, 1);                               \
-            uint32_t _n1 = (_s1 < RANS32_L);                                    \
-            uint32_t _w1 = rans32_load_u16_ua(P);                               \
-            _s1 = _n1 ? ((_s1 << 16u) | _w1) : _s1;                             \
-            (P) += (_n1 << 1u);                                                 \
-            uint32_t _s2 = vgetq_lane_u32(ST, 2);                               \
-            uint32_t _n2 = (_s2 < RANS32_L);                                    \
-            uint32_t _w2 = rans32_load_u16_ua(P);                               \
-            _s2 = _n2 ? ((_s2 << 16u) | _w2) : _s2;                             \
-            (P) += (_n2 << 1u);                                                 \
-            uint32_t _s3 = vgetq_lane_u32(ST, 3);                               \
-            uint32_t _n3 = (_s3 < RANS32_L);                                    \
-            uint32_t _w3 = rans32_load_u16_ua(P);                               \
-            _s3 = _n3 ? ((_s3 << 16u) | _w3) : _s3;                             \
-            (P) += (_n3 << 1u);                                                 \
-            ST = (uint32x4_t){_s0, _s1, _s2, _s3};                              \
+            uint8x8_t  _w8   = vld1_u8(P);                                      \
+            uint8x16_t _w16  = vcombine_u8(_w8, _w8);                           \
+            uint8x16_t _shuf = vld1q_u8(SHUF_TBL[MASK4]);                       \
+            uint32x4_t _wv   = vreinterpretq_u32_u8(vqtbl1q_u8(_w16, _shuf));   \
+            uint32x4_t _ref  = vorrq_u32(vshlq_n_u32(ST, 16), _wv);             \
+            ST = vbslq_u32(LT_VEC, _ref, ST);                                   \
         } while (0)
 
     #define RANS32_SAFE_REFILL4(ST, P)                                          \
@@ -670,29 +727,20 @@ static inline bool rans32_decode_tile_neon_bytes(
             ST = (uint32x4_t){_s0, _s1, _s2, _s3};                              \
         } while (0)
 
-    for (uint32_t step = 0; step < full_steps; ++step) {
+    for (uint32_t step = 0u; step < full_steps; ++step) {
         uint8_t* dst = out_tile + (step << 5u);
 
-        RANS32_NEON_STEP_GROUP(st0, dst +  0, n0);
-        RANS32_NEON_STEP_GROUP(st1, dst +  4, n1);
-        RANS32_NEON_STEP_GROUP(st2, dst +  8, n2);
-        RANS32_NEON_STEP_GROUP(st3, dst + 12, n3);
-        RANS32_NEON_STEP_GROUP(st4, dst + 16, n4);
-        RANS32_NEON_STEP_GROUP(st5, dst + 20, n5);
-        RANS32_NEON_STEP_GROUP(st6, dst + 24, n6);
-        RANS32_NEON_STEP_GROUP(st7, dst + 28, n7);
+        RANS32_NEON_STEP_GROUP(st0, dst +  0, lt0, m0);
+        RANS32_NEON_STEP_GROUP(st1, dst +  4, lt1, m1);
+        RANS32_NEON_STEP_GROUP(st2, dst +  8, lt2, m2);
+        RANS32_NEON_STEP_GROUP(st3, dst + 12, lt3, m3);
+        RANS32_NEON_STEP_GROUP(st4, dst + 16, lt4, m4);
+        RANS32_NEON_STEP_GROUP(st5, dst + 20, lt5, m5);
+        RANS32_NEON_STEP_GROUP(st6, dst + 24, lt6, m6);
+        RANS32_NEON_STEP_GROUP(st7, dst + 28, lt7, m7);
 
-        const uint32_t c0 = vaddvq_u32(n0);
-        const uint32_t c1 = vaddvq_u32(n1);
-        const uint32_t c2 = vaddvq_u32(n2);
-        const uint32_t c3 = vaddvq_u32(n3);
-        const uint32_t c4 = vaddvq_u32(n4);
-        const uint32_t c5 = vaddvq_u32(n5);
-        const uint32_t c6 = vaddvq_u32(n6);
-        const uint32_t c7 = vaddvq_u32(n7);
-
-        const uint32_t o1 = c0,      o2 = o1 + c1, o3 = o2 + c2, o4 = o3 + c3;
-        const uint32_t o5 = o4 + c4, o6 = o5 + c5, o7 = o6 + c6, cnt = o7 + c7;
+        const uint32_t o1 = CNT4[m0],      o2 = o1 + CNT4[m1], o3 = o2 + CNT4[m2], o4 = o3 + CNT4[m3];
+        const uint32_t o5 = o4 + CNT4[m4], o6 = o5 + CNT4[m5], o7 = o6 + CNT4[m6], cnt = o7 + CNT4[m7];
 
         if (__builtin_expect(rp < cnt, 0)) return false;
         rp -= cnt;
@@ -705,14 +753,14 @@ static inline bool rans32_decode_tile_neon_bytes(
         const uint8_t* p6 = base_p + (o6 << 1u);  const uint8_t* p7 = base_p + (o7 << 1u);
 
         if (__builtin_expect(rp + 32u <= word_count, 1)) {
-            RANS32_BRANCHLESS_REFILL4(st0, p0);
-            RANS32_BRANCHLESS_REFILL4(st1, p1);
-            RANS32_BRANCHLESS_REFILL4(st2, p2);
-            RANS32_BRANCHLESS_REFILL4(st3, p3);
-            RANS32_BRANCHLESS_REFILL4(st4, p4);
-            RANS32_BRANCHLESS_REFILL4(st5, p5);
-            RANS32_BRANCHLESS_REFILL4(st6, p6);
-            RANS32_BRANCHLESS_REFILL4(st7, p7);
+            RANS32_NEON_TBL_REFILL4(st0, lt0, m0, p0);
+            RANS32_NEON_TBL_REFILL4(st1, lt1, m1, p1);
+            RANS32_NEON_TBL_REFILL4(st2, lt2, m2, p2);
+            RANS32_NEON_TBL_REFILL4(st3, lt3, m3, p3);
+            RANS32_NEON_TBL_REFILL4(st4, lt4, m4, p4);
+            RANS32_NEON_TBL_REFILL4(st5, lt5, m5, p5);
+            RANS32_NEON_TBL_REFILL4(st6, lt6, m6, p6);
+            RANS32_NEON_TBL_REFILL4(st7, lt7, m7, p7);
         } else {
             RANS32_SAFE_REFILL4(st0, p0);
             RANS32_SAFE_REFILL4(st1, p1);
@@ -726,7 +774,7 @@ static inline bool rans32_decode_tile_neon_bytes(
     }
 
     #undef RANS32_NEON_STEP_GROUP
-    #undef RANS32_BRANCHLESS_REFILL4
+    #undef RANS32_NEON_TBL_REFILL4
     #undef RANS32_SAFE_REFILL4
 
     uint32_t st[RANS32_LANES];
@@ -762,7 +810,7 @@ static inline bool rans32_decode_tile_neon_bytes(
     }
 
     if (rp != 0u) return false;
-    for (uint32_t l = 0; l < RANS32_LANES; ++l) {
+    for (uint32_t l = 0u; l < RANS32_LANES; ++l) {
         if (st[l] != RANS32_L) return false;
     }
     return true;

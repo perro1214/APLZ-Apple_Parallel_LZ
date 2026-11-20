@@ -425,19 +425,20 @@ struct HxLzBlockOutput {
     }
 };
 
-// ─── 2b. スレッド固有 (thread_local) 遅延確保 + エポック方式ハッシュテーブル ────
-// ・必要レベルのテーブルだけを初回遅延確保 (L1 は 64 KB のみ、Random/FP16/Decode は 0 B!)
-// ・Zstd 型エポック加算により毎ブロック memset ゼロ & 他ブロックの偽マッチロードも完全ゼロ!
+// ─── 2b. スレッド固有 (thread_local) 遅延確保 + タグ付きエポック方式ハッシュテーブル ─
+// ・必要レベルのテーブルだけを初回遅延確保 (L1: 64 KB, L3: 128 KB → M4 L1D 常駐!)
+// ・エントリ 32-bit = [epoch:8 | hash_tag:6 | pos:18] (pos < 256 KiB = 2^18)
+//   → 1 回の XOR+CMP で前ブロック棄却と 6-bit 偽陽性弾き (98.4% ランダムロード削減) を同時実行!
 struct HxLzThreadState {
-    static const uint32_t HBITS_FAST = 14u; // 16K * 4B = 64 KB (L1D 常駐!)
-    static const uint32_t HBITS_DEF  = 15u; // 32K * 2 * 4B = 256 KB (L2 常駐!)
+    static const uint32_t HBITS_FAST = 14u; // 16K * 4B = 64 KB (P/E-core 両 L1D 常駐!)
+    static const uint32_t HBITS_DEF  = 15u; // 32K * 8B = 256 KB (64-bit 1-load/1-store + 6-bit tag = 実効 21-bit!)
     static const uint32_t HBITS_HIGH = 15u; // 32K * 4 * 4B = 512 KB (L2 常駐!)
 
     uint32_t* ht_fast = nullptr;
-    uint32_t* ht_def  = nullptr; // [1<<15][2]
+    uint64_t* ht_def  = nullptr; // [1<<14] packed 2-way (low32=newest, high32=prev)
     uint32_t* ht_high = nullptr; // [1<<15][4]
-    uint32_t  ep_fast = HX_BLOCK_SIZE;
-    uint32_t  ep_def  = HX_BLOCK_SIZE;
+    uint32_t  ep_fast = 0u;      // 1..255 (上位 8 bit へシフト)
+    uint32_t  ep_def  = 0u;      // 1..255 (上位 8 bit へシフト)
     uint32_t  ep_high = HX_BLOCK_SIZE;
     HxRawBuf  xtmp; // LZ+Xform 時のみ遅延確保 (256 KiB)
 
@@ -447,33 +448,33 @@ struct HxLzThreadState {
         free(ht_high);
     }
 
-    uint32_t* acquire_fast(uint32_t& out_ep) {
+    uint32_t* acquire_fast(uint32_t& out_ep_hi) {
         if (!ht_fast) {
             ht_fast = (uint32_t*)calloc(1u << HBITS_FAST, sizeof(uint32_t));
-            ep_fast = HX_BLOCK_SIZE;
+            ep_fast = 1u;
         } else {
-            ep_fast += HX_BLOCK_SIZE;
-            if (ep_fast > 0xF0000000u) {
+            ep_fast++;
+            if (ep_fast >= 256u) {
                 memset(ht_fast, 0, (size_t)(1u << HBITS_FAST) * sizeof(uint32_t));
-                ep_fast = HX_BLOCK_SIZE;
+                ep_fast = 1u;
             }
         }
-        out_ep = ep_fast;
+        out_ep_hi = ep_fast << 24u;
         return ht_fast;
     }
 
-    uint32_t* acquire_def(uint32_t& out_ep) {
+    uint64_t* acquire_def(uint32_t& out_ep_hi) {
         if (!ht_def) {
-            ht_def = (uint32_t*)calloc((size_t)(1u << HBITS_DEF) * 2u, sizeof(uint32_t));
-            ep_def = HX_BLOCK_SIZE;
+            ht_def = (uint64_t*)calloc(1u << HBITS_DEF, sizeof(uint64_t));
+            ep_def = 1u;
         } else {
-            ep_def += HX_BLOCK_SIZE;
-            if (ep_def > 0xF0000000u) {
-                memset(ht_def, 0, (size_t)(1u << HBITS_DEF) * 2u * sizeof(uint32_t));
-                ep_def = HX_BLOCK_SIZE;
+            ep_def++;
+            if (ep_def >= 256u) {
+                memset(ht_def, 0, (size_t)(1u << HBITS_DEF) * sizeof(uint64_t));
+                ep_def = 1u;
             }
         }
-        out_ep = ep_def;
+        out_ep_hi = ep_def << 24u;
         return ht_def;
     }
 
@@ -503,7 +504,7 @@ static inline HxLzThreadState& hx_get_thread_lz_state() {
     return st;
 }
 
-// ─── 3. 分離ストリーム LZ エンコーダ (Level 1 / 3 / 6 — エポック + 1-store ExtraBits) ─
+// ─── 3. 分離ストリーム LZ エンコーダ (Level 1 / 3 / 6 — タグ付きエポック + 1-store ExtraBits) ─
 static inline bool hx_lz_encode_block(
     const uint8_t* __restrict src,
     uint32_t                  len,
@@ -537,20 +538,31 @@ static inline bool hx_lz_encode_block(
             lit_p += ll;
         }
         uint32_t ll_ex, ll_eb, ml_ex, ml_eb, of_ex = 0u, of_eb = 0u;
-        uint8_t ll_c = hx_len_to_code(ll, &ll_ex, &ll_eb);
-        uint8_t ml_c = hx_len_to_code(ml - HX_MIN_MATCH, &ml_ex, &ml_eb);
+        uint8_t ll_c;
+        if (__builtin_expect(ll < 16u, 1)) {
+            ll_c = (uint8_t)ll; ll_ex = 0u; ll_eb = 0u;
+        } else {
+            ll_c = hx_len_to_code(ll, &ll_ex, &ll_eb);
+        }
+        uint32_t ml_adj = ml - HX_MIN_MATCH;
+        uint8_t ml_c;
+        if (__builtin_expect(ml_adj < 16u, 1)) {
+            ml_c = (uint8_t)ml_adj; ml_ex = 0u; ml_eb = 0u;
+        } else {
+            ml_c = hx_len_to_code(ml_adj, &ml_ex, &ml_eb);
+        }
         uint8_t of_c;
-        if (dist == rep0) {
+        if (__builtin_expect(dist != rep0 && dist != rep1 && dist != rep2, 1)) {
+            of_c = hx_dist_to_code(dist, &of_ex, &of_eb);
+            rep2 = rep1; rep1 = rep0; rep0 = dist;
+        } else if (dist == rep0) {
             of_c = 0u;
         } else if (dist == rep1) {
             of_c = 1u;
             std::swap(rep0, rep1);
-        } else if (dist == rep2) {
+        } else {
             of_c = 2u;
             uint32_t tmp = rep2; rep2 = rep1; rep1 = rep0; rep0 = tmp;
-        } else {
-            of_c = hx_dist_to_code(dist, &of_ex, &of_eb);
-            rep2 = rep1; rep1 = rep0; rep0 = dist;
         }
         *ll_p++ = ll_c;
         *ml_p++ = ml_c;
@@ -558,7 +570,7 @@ static inline bool hx_lz_encode_block(
 
         // ブランチレス 1-store 64-bit パッキング (最大 51 bit + bit_cnt<=7 = 58 bit)
         uint32_t tot_eb = ll_eb + ml_eb + of_eb;
-        if (tot_eb) {
+        if (__builtin_expect(tot_eb != 0u, 1)) {
             uint64_t packed = (uint64_t)ll_ex
                             | ((uint64_t)ml_ex << ll_eb)
                             | ((uint64_t)of_ex << (ll_eb + ml_eb));
@@ -578,44 +590,88 @@ static inline bool hx_lz_encode_block(
     uint32_t matched_bytes = 0u;
 
     if (level <= 1u) {
-        // ── Level 1 (--fast): 1-way L1D 64 KB エポックハッシュ + 8B 即時マッチ + ステップ加速 ──
-        uint32_t ep;
-        uint32_t* __restrict ht = ts.acquire_fast(ep);
-        ht[hx_hash4(hx_read32(src), HxLzThreadState::HBITS_FAST)] = ep;
+        // ── Level 1 (--fast): 1-way L1D 64 KB タグ付きエポックハッシュ + 極薄スキャンループ ──
+        uint32_t ep_hi;
+        uint32_t* __restrict ht = ts.acquire_fast(ep_hi);
+        {
+            uint32_t hv0 = hx_read32(src) * 2654435761u;
+            ht[hv0 >> (32u - HxLzThreadState::HBITS_FAST)] = ep_hi | ((hv0 & 0x0003F000u) << 6u);
+        }
 
         while (pos < mflimit) {
-            uint32_t miss = 64u;
             uint32_t best_len = 0u, best_dist = 0u;
 
-            // マッチ直後 (anchor..anchor+3) のみ高確率な rep0 を高速チェック
-            uint32_t rep_limit = std::min(mflimit, anchor + 4u);
-            while (pos < mflimit) {
-                uint64_t cur8 = hx_read64(src + pos);
-                uint32_t cur4 = (uint32_t)cur8;
-
-                if (pos < rep_limit && pos >= rep0) {
-                    uint64_t rdiff = hx_read64(src + pos - rep0) ^ cur8;
-                    if ((uint32_t)rdiff == 0u) {
-                        best_len  = hx_match_len_from_diff8(rdiff, src + pos - rep0, src + pos, len - pos);
-                        best_dist = rep0;
-                        ht[hx_hash4(cur4, HxLzThreadState::HBITS_FAST)] = ep + pos;
-                        break;
-                    }
-                }
-
-                uint32_t h    = hx_hash4(cur4, HxLzThreadState::HBITS_FAST);
-                uint32_t rel  = ht[h] - ep;
-                ht[h]         = ep + pos;
+            // 1) まず anchor (pos) の通常ハッシュを 1 回チェック (連続長マッチを見逃さない!)
+            {
+                uint64_t cur8   = hx_read64(src + pos);
+                uint32_t hv     = (uint32_t)cur8 * 2654435761u;
+                uint32_t h      = hv >> (32u - HxLzThreadState::HBITS_FAST);
+                uint32_t expect = ep_hi | ((hv & 0x0003F000u) << 6u);
+                uint32_t rel    = ht[h] ^ expect;
+                ht[h]           = expect | pos;
                 if (rel < pos) {
                     uint64_t diff = hx_read64(src + rel) ^ cur8;
                     if ((uint32_t)diff == 0u) {
                         best_len  = hx_match_len_from_diff8(diff, src + rel, src + pos, len - pos);
                         best_dist = pos - rel;
-                        break;
                     }
                 }
-                pos  += (miss >> 6u);
-                miss += 2u;
+            }
+
+            // 2) anchor が外れた場合のみ、anchor+1..anchor+3 で高確率な rep0 をチェック (ループ外!)
+            if (best_len < HX_MIN_MATCH) {
+                pos++;
+                const uint32_t rep_lim = std::min(mflimit, anchor + 4u);
+                while (pos < rep_lim) {
+                    uint64_t cur8 = hx_read64(src + pos);
+                    if (pos >= rep0) {
+                        uint64_t rdiff = hx_read64(src + pos - rep0) ^ cur8;
+                        if ((uint32_t)rdiff == 0u) {
+                            uint32_t hv = (uint32_t)cur8 * 2654435761u;
+                            ht[hv >> (32u - HxLzThreadState::HBITS_FAST)] = ep_hi | ((hv & 0x0003F000u) << 6u) | pos;
+                            best_len  = hx_match_len_from_diff8(rdiff, src + pos - rep0, src + pos, len - pos);
+                            best_dist = rep0;
+                            break;
+                        }
+                    }
+                    uint32_t hv     = (uint32_t)cur8 * 2654435761u;
+                    uint32_t h      = hv >> (32u - HxLzThreadState::HBITS_FAST);
+                    uint32_t expect = ep_hi | ((hv & 0x0003F000u) << 6u);
+                    uint32_t rel    = ht[h] ^ expect;
+                    ht[h]           = expect | pos;
+                    if (rel < pos) {
+                        uint64_t diff = hx_read64(src + rel) ^ cur8;
+                        if ((uint32_t)diff == 0u) {
+                            best_len  = hx_match_len_from_diff8(diff, src + rel, src + pos, len - pos);
+                            best_dist = pos - rel;
+                            break;
+                        }
+                    }
+                    pos++;
+                }
+            }
+
+            // 3) 以降は rep0 分岐完全ゼロの極薄高速スキャンループ!
+            if (best_len < HX_MIN_MATCH) {
+                uint32_t miss = 36u;
+                while (pos < mflimit) {
+                    uint64_t cur8   = hx_read64(src + pos);
+                    uint32_t hv     = (uint32_t)cur8 * 2654435761u;
+                    uint32_t h      = hv >> (32u - HxLzThreadState::HBITS_FAST);
+                    uint32_t expect = ep_hi | ((hv & 0x0003F000u) << 6u);
+                    uint32_t rel    = ht[h] ^ expect;
+                    ht[h]           = expect | pos;
+                    if (rel < pos) {
+                        uint64_t diff = hx_read64(src + rel) ^ cur8;
+                        if ((uint32_t)diff == 0u) {
+                            best_len  = hx_match_len_from_diff8(diff, src + rel, src + pos, len - pos);
+                            best_dist = pos - rel;
+                            break;
+                        }
+                    }
+                    pos += (miss >> 5u);
+                    miss++;
+                }
             }
             if (best_len < HX_MIN_MATCH) break;
 
@@ -629,24 +685,28 @@ static inline bool hx_lz_encode_block(
             pos += best_len;
             anchor = pos;
             if (pos < mflimit && pos >= 2u) {
-                ht[hx_hash4(hx_read32(src + pos - 2u), HxLzThreadState::HBITS_FAST)] = ep + (pos - 2u);
+                uint32_t hv = hx_read32(src + pos - 2u) * 2654435761u;
+                ht[hv >> (32u - HxLzThreadState::HBITS_FAST)] = ep_hi | ((hv & 0x0003F000u) << 6u) | (pos - 2u);
             }
         }
     } else if (level <= 3u) {
-        // ── Level 3 (--default): 2-way 32K エポックハッシュ + 近傍 Repeat + 1-byte Lazy + 後方拡張 ──
-        uint32_t ep;
-        uint32_t* __restrict ht = ts.acquire_def(ep);
+        // ── Level 3 (--default): 2-way 64-bit 1-load/1-store 32K タグ付きハッシュ (実効 21-bit) + 高速 Lazy ──
+        uint32_t ep_hi;
+        uint64_t* __restrict ht64 = ts.acquire_def(ep_hi);
 
         auto insert2 = [&](uint32_t p) {
-            uint32_t idx = hx_hash4(hx_read32(src + p), HxLzThreadState::HBITS_DEF) << 1u;
-            ht[idx + 1u] = ht[idx];
-            ht[idx]      = ep + p;
+            uint32_t hv     = hx_read32(src + p) * 2654435761u;
+            uint32_t h      = hv >> (32u - HxLzThreadState::HBITS_DEF);
+            uint32_t expect = ep_hi | ((hv & 0x0001F800u) << 7u);
+            uint64_t pair   = ht64[h];
+            ht64[h]         = (pair << 32u) | (uint64_t)(expect | p);
         };
+
         auto find2 = [&](uint32_t p, bool check_rep, uint32_t& out_len, uint32_t& out_dist) {
             uint64_t cur8 = hx_read64(src + p);
             uint32_t cur4 = (uint32_t)cur8;
             out_len = 0u; out_dist = 0u;
-            if (check_rep) {
+            if (__builtin_expect(check_rep, 0)) {
                 if (p >= rep0) {
                     uint64_t rd = hx_read64(src + p - rep0) ^ cur8;
                     if ((uint32_t)rd == 0u) {
@@ -662,15 +722,16 @@ static inline bool hx_lz_encode_block(
                     }
                 }
             }
-            uint32_t idx = hx_hash4(cur4, HxLzThreadState::HBITS_DEF) << 1u;
-            uint32_t r0  = ht[idx] - ep;
-            uint32_t r1  = ht[idx + 1u] - ep;
-            ht[idx + 1u] = ht[idx];
-            ht[idx]      = ep + p;
+            uint32_t hv     = cur4 * 2654435761u;
+            uint32_t h      = hv >> (32u - HxLzThreadState::HBITS_DEF);
+            uint32_t expect = ep_hi | ((hv & 0x0001F800u) << 7u);
+            uint64_t pair   = ht64[h];
+            ht64[h]         = (pair << 32u) | (uint64_t)(expect | p);
 
-            if (out_len >= 32u) return;
+            if (out_len >= 24u) return;
 
-            uint32_t thresh = (out_dist == rep0 || out_dist == rep1) ? (out_len + 1u) : out_len;
+            uint32_t thresh = (out_len > 0u) ? (out_len + 1u) : 0u;
+            uint32_t r0 = (uint32_t)pair ^ expect;
             if (r0 < p) {
                 uint64_t diff = hx_read64(src + r0) ^ cur8;
                 if ((uint32_t)diff == 0u) {
@@ -678,11 +739,60 @@ static inline bool hx_lz_encode_block(
                     if (ml > thresh) { out_len = ml; out_dist = p - r0; thresh = ml; }
                 }
             }
+            uint32_t r1 = (uint32_t)(pair >> 32u) ^ expect;
             if (out_len < 16u && r1 < p) {
                 uint64_t diff = hx_read64(src + r1) ^ cur8;
                 if ((uint32_t)diff == 0u) {
                     uint32_t ml = hx_match_len_from_diff8(diff, src + r1, src + p, len - p);
                     if (ml > thresh) { out_len = ml; out_dist = p - r1; }
+                }
+            }
+        };
+
+        // 高速 Lazy 探索 (1-load/1-store で c0/c1 両方を取得しつつ末尾バイト弾きで即判定!)
+        auto find_lazy1 = [&](uint32_t p, uint32_t cur_mlen, bool cur_is_rep, uint32_t& out_len, uint32_t& out_dist) {
+            uint64_t cur8   = hx_read64(src + p);
+            uint32_t cur4   = (uint32_t)cur8;
+            uint32_t hv     = cur4 * 2654435761u;
+            uint32_t h      = hv >> (32u - HxLzThreadState::HBITS_DEF);
+            uint32_t expect = ep_hi | ((hv & 0x0001F800u) << 7u);
+            uint64_t pair   = ht64[h];
+            ht64[h]         = (pair << 32u) | (uint64_t)(expect | p);
+
+            out_len = 0u; out_dist = 0u;
+            const uint32_t need_rep = cur_mlen + 1u;
+            const uint32_t need_reg = cur_mlen + (cur_is_rep ? 2u : 1u);
+            const bool     can_end  = (p + cur_mlen < len);
+            const uint8_t  end_b    = can_end ? src[p + cur_mlen] : 0u;
+
+            if (p >= rep0 && can_end && src[p - rep0 + cur_mlen] == end_b) {
+                uint64_t rd = hx_read64(src + p - rep0) ^ cur8;
+                if ((uint32_t)rd == 0u) {
+                    uint32_t ml = hx_match_len_from_diff8(rd, src + p - rep0, src + p, len - p);
+                    if (ml >= need_rep) { out_len = ml; out_dist = rep0; return; }
+                }
+            }
+            if (p >= rep1 && can_end && src[p - rep1 + cur_mlen] == end_b) {
+                uint64_t rd = hx_read64(src + p - rep1) ^ cur8;
+                if ((uint32_t)rd == 0u) {
+                    uint32_t ml = hx_match_len_from_diff8(rd, src + p - rep1, src + p, len - p);
+                    if (ml >= need_rep) { out_len = ml; out_dist = rep1; return; }
+                }
+            }
+            uint32_t r0 = (uint32_t)pair ^ expect;
+            if (r0 < p && can_end && src[r0 + cur_mlen] == end_b) {
+                uint64_t diff = hx_read64(src + r0) ^ cur8;
+                if ((uint32_t)diff == 0u) {
+                    uint32_t ml = hx_match_len_from_diff8(diff, src + r0, src + p, len - p);
+                    if (ml >= need_reg) { out_len = ml; out_dist = p - r0; return; }
+                }
+            }
+            uint32_t r1 = (uint32_t)(pair >> 32u) ^ expect;
+            if (r1 < p && can_end && src[r1 + cur_mlen] == end_b) {
+                uint64_t diff = hx_read64(src + r1) ^ cur8;
+                if ((uint32_t)diff == 0u) {
+                    uint32_t ml = hx_match_len_from_diff8(diff, src + r1, src + p, len - p);
+                    if (ml >= need_reg) { out_len = ml; out_dist = p - r1; }
                 }
             }
         };
@@ -703,15 +813,17 @@ static inline bool hx_lz_encode_block(
                 }
             }
             miss = 0u;
+            bool did_lazy = false;
             if (pos + 1u < mflimit && mlen < 32u) {
+                did_lazy = true;
                 uint32_t nlen, ndist;
-                find2(pos + 1u, true, nlen, ndist);
-                bool next_is_rep = (ndist == rep0 || ndist == rep1);
-                bool cur_is_rep  = (mdist == rep0 || mdist == rep1);
-                if (nlen > mlen + (cur_is_rep && !next_is_rep ? 1u : 0u)) {
+                bool cur_is_rep = (mdist == rep0 || mdist == rep1);
+                find_lazy1(pos + 1u, mlen, cur_is_rep, nlen, ndist);
+                if (nlen > 0u) {
                     pos++;
                     mlen = nlen;
                     mdist = ndist;
+                    did_lazy = false;
                 }
             }
 
@@ -719,9 +831,8 @@ static inline bool hx_lz_encode_block(
             matched_bytes += mlen;
             uint32_t end_pos = pos + mlen;
             if (end_pos < mflimit) {
-                insert2(pos + 1u);
-                if (pos + 2u < end_pos) insert2(pos + 2u);
-                if (end_pos >= 2u && end_pos - 2u > pos + 2u) insert2(end_pos - 2u);
+                if (!did_lazy) insert2(pos + 1u);
+                if (end_pos >= 2u && end_pos - 2u > pos + 1u) insert2(end_pos - 2u);
             }
             pos = end_pos;
             anchor = pos;
@@ -837,7 +948,7 @@ static inline bool hx_lz_encode_block(
 }
 
 // ─── 4. 超高速 ARM64 分離ストリーム LZ デコーダ ─────────────────────────────────
-// 1-load 64-bit extra bits + 高速マッチ展開 + 厳密境界検証
+// 16B 固定 wildcopy + 分岐レス 64-bit ExtraBits + NEON RLE/小周期展開 + 厳密境界検証
 static inline bool hx_lz_decode_block(
     const HxLzBlockMeta& meta,
     const uint8_t* __restrict lit,
@@ -849,102 +960,180 @@ static inline bool hx_lz_decode_block(
     uint8_t*       __restrict dst,
     uint32_t                  raw_size
 ) {
+    struct HxLenDec { uint32_t base; uint32_t eb; };
+    static constexpr HxLenDec LL_DEC[HX_LEN_CODES] = {
+        {0,0},{1,0},{2,0},{3,0},{4,0},{5,0},{6,0},{7,0},
+        {8,0},{9,0},{10,0},{11,0},{12,0},{13,0},{14,0},{15,0},
+        {16,1},{18,1},{20,2},{24,2},{28,3},{36,3},{44,4},{60,4},
+        {76,5},{108,6},{172,7},{300,8},{556,9},{1068,10},{2092,11},
+        {4140,12},{8236,13},{16428,14},{32812,15},{65580,16},{131116,17}
+    };
+    static constexpr HxLenDec ML_DEC[HX_LEN_CODES] = {
+        {4,0},{5,0},{6,0},{7,0},{8,0},{9,0},{10,0},{11,0},
+        {12,0},{13,0},{14,0},{15,0},{16,0},{17,0},{18,0},{19,0},
+        {20,1},{22,1},{24,2},{28,2},{32,3},{40,3},{48,4},{64,4},
+        {80,5},{112,6},{176,7},{304,8},{560,9},{1072,10},{2096,11},
+        {4144,12},{8240,13},{16432,14},{32816,15},{65584,16},{131120,17}
+    };
+    static constexpr HxLenDec OF_DEC[HX_OF_CODES] = {
+        {0,0},{0,0},{0,0},
+        {1u<<0,0},{1u<<1,1},{1u<<2,2},{1u<<3,3},{1u<<4,4},{1u<<5,5},
+        {1u<<6,6},{1u<<7,7},{1u<<8,8},{1u<<9,9},{1u<<10,10},{1u<<11,11},
+        {1u<<12,12},{1u<<13,13},{1u<<14,14},{1u<<15,15},{1u<<16,16},{1u<<17,17}
+    };
+    static constexpr uint64_t BIT_MASK[18] = {
+        0x00000ull, 0x00001ull, 0x00003ull, 0x00007ull,
+        0x0000full, 0x0001full, 0x0003full, 0x0007full,
+        0x000ffull, 0x001ffull, 0x003ffull, 0x007ffull,
+        0x00fffull, 0x01fffull, 0x03fffull, 0x07fffull,
+        0x0ffffull, 0x1ffffull
+    };
+
     uint32_t rep0 = 1u, rep1 = 4u, rep2 = 8u;
     uint32_t out_pos = 0u;
     uint32_t lit_pos = 0u;
     uint64_t bit_pos = 0ull;
     const uint64_t max_bits = (uint64_t)extra_bytes * 8ull;
+    const uint32_t lit_size = meta.lit_size;
+    const uint32_t n_seq    = meta.num_seqs;
+    const uint32_t out_safe = (raw_size >= 16u) ? (raw_size - 16u) : 0u;
+    const uint32_t lit_safe = (lit_size >= 16u) ? (lit_size - 16u) : 0u;
 
-    const uint32_t n_seq = meta.num_seqs;
     for (uint32_t i = 0u; i < n_seq; ++i) {
-        uint8_t lc = ll_c[i];
-        uint8_t mc = ml_c[i];
-        uint8_t oc = of_c[i];
-        if (__builtin_expect(lc >= HX_LEN_CODES || mc >= HX_LEN_CODES || oc >= HX_OF_CODES, 0))
+        uint32_t lc = ll_c[i];
+        uint32_t mc = ml_c[i];
+        uint32_t oc = of_c[i];
+        if (__builtin_expect((lc >= HX_LEN_CODES) | (mc >= HX_LEN_CODES) | (oc >= HX_OF_CODES), 0))
             return false;
 
-        uint32_t ll_eb = HX_LEN_EB[lc];
-        uint32_t ml_eb = HX_LEN_EB[mc];
-        uint32_t of_eb = (oc >= 3u) ? (uint32_t)(oc - 3u) : 0u;
-        uint32_t tot_eb = ll_eb + ml_eb + of_eb;
+        const uint32_t ll_eb = LL_DEC[lc].eb;
+        const uint32_t ml_eb = ML_DEC[mc].eb;
+        const uint32_t of_eb = OF_DEC[oc].eb;
+        const uint32_t tot_eb = ll_eb + ml_eb + of_eb;
 
-        uint32_t ll = HX_LEN_BASE[lc];
-        uint32_t ml = HX_LEN_BASE[mc] + HX_MIN_MATCH;
+        // 無条件 64-bit ロード + 分岐レス抽出 (extra_bits 末尾の 8B 余白により bit_pos<=max_bits で常時安全)
+        if (__builtin_expect(bit_pos + tot_eb > max_bits, 0)) return false;
+        uint64_t w;
+        memcpy(&w, extra_bits + (bit_pos >> 3u), 8u);
+        w >>= (bit_pos & 7u);
+        bit_pos += tot_eb;
+
+        const uint32_t ll = LL_DEC[lc].base + (uint32_t)(w & BIT_MASK[ll_eb]);
+        w >>= ll_eb;
+        const uint32_t ml = ML_DEC[mc].base + (uint32_t)(w & BIT_MASK[ml_eb]);
+        w >>= ml_eb;
+
         uint32_t dist;
-
-        if (tot_eb > 0u) {
-            if (__builtin_expect(bit_pos + tot_eb > max_bits, 0)) return false;
-            uint64_t w;
-            memcpy(&w, extra_bits + (bit_pos >> 3u), 8u);
-            w >>= (bit_pos & 7u);
-            bit_pos += tot_eb;
-
-            ll += (uint32_t)(w & ((1ull << ll_eb) - 1ull)); w >>= ll_eb;
-            ml += (uint32_t)(w & ((1ull << ml_eb) - 1ull)); w >>= ml_eb;
-
-            if (oc == 0u) {
-                dist = rep0;
-            } else if (oc == 1u) {
-                dist = rep1; std::swap(rep0, rep1);
-            } else if (oc == 2u) {
-                dist = rep2; uint32_t tmp = rep2; rep2 = rep1; rep1 = rep0; rep0 = tmp;
-            } else {
-                dist = (1u << of_eb) + (uint32_t)(w & ((1ull << of_eb) - 1ull));
-                rep2 = rep1; rep1 = rep0; rep0 = dist;
-            }
+        if (__builtin_expect(oc >= 3u, 1)) {
+            dist = OF_DEC[oc].base + (uint32_t)(w & BIT_MASK[of_eb]);
+            rep2 = rep1; rep1 = rep0; rep0 = dist;
+        } else if (oc == 0u) {
+            dist = rep0;
+        } else if (oc == 1u) {
+            dist = rep1; rep1 = rep0; rep0 = dist;
         } else {
-            if (oc == 0u) {
-                dist = rep0;
-            } else if (oc == 1u) {
-                dist = rep1; std::swap(rep0, rep1);
-            } else if (oc == 2u) {
-                dist = rep2; uint32_t tmp = rep2; rep2 = rep1; rep1 = rep0; rep0 = tmp;
-            } else {
-                dist = 1u;
-                rep2 = rep1; rep1 = rep0; rep0 = 1u;
-            }
+            dist = rep2; rep2 = rep1; rep1 = rep0; rep0 = dist;
         }
 
-        // リテラルコピー
-        if (__builtin_expect(lit_pos + ll > meta.lit_size || out_pos + ll > raw_size, 0))
-            return false;
-        if (ll > 0u) {
-            memcpy(dst + out_pos, lit + lit_pos, ll);
+        // リテラルコピー (97-100% が ll<=16 → 16B 固定コピー 2 命令!)
+        if (__builtin_expect(ll <= 16u && lit_pos <= lit_safe && out_pos <= out_safe, 1)) {
+            memcpy(dst + out_pos, lit + lit_pos, 16u);
             lit_pos += ll;
             out_pos += ll;
+        } else {
+            if (__builtin_expect((lit_pos + ll > lit_size) | (out_pos + ll > raw_size), 0))
+                return false;
+            if (ll > 0u) {
+                uint8_t*       ld = dst + out_pos;
+                const uint8_t* ls = lit + lit_pos;
+                if (out_pos + ll <= out_safe && lit_pos + ll <= lit_safe) {
+                    uint32_t k = 0u;
+                    do {
+                        memcpy(ld + k, ls + k, 16u);
+                        k += 16u;
+                    } while (k < ll);
+                } else {
+                    memcpy(ld, ls, ll);
+                }
+                lit_pos += ll;
+                out_pos += ll;
+            }
         }
 
-        // マッチコピー
-        if (__builtin_expect(dist == 0u || dist > out_pos || out_pos + ml > raw_size, 0))
+        // マッチコピー (81-97% が ml<=16 → dist>=16 なら 16B 固定コピー 2 命令!)
+        const uint32_t out_end = out_pos + ml;
+        if (__builtin_expect((dist == 0u) | (dist > out_pos) | (out_end > raw_size), 0))
             return false;
 
         uint8_t*       dp = dst + out_pos;
         const uint8_t* sp = dp - dist;
-        if (dist >= ml) {
+        if (__builtin_expect(dist >= 16u && out_end <= out_safe, 1)) {
+            memcpy(dp, sp, 16u);
+            if (__builtin_expect(ml > 16u, 0)) {
+                uint32_t k = 16u;
+                do {
+                    memcpy(dp + k, sp + k, 16u);
+                    k += 16u;
+                } while (k < ml);
+            }
+        } else if (dist >= 8u && out_end + 8u <= raw_size) {
+            uint32_t k = 0u;
+            do {
+                memcpy(dp + k, sp + k, 8u);
+                k += 8u;
+            } while (k < ml);
+        } else if (dist >= ml) {
             memcpy(dp, sp, ml);
         } else if (dist == 1u) {
-            memset(dp, sp[0], ml);
-        } else {
-            uint32_t copied = 0u;
-            while (copied < ml) {
-                uint32_t chunk = std::min(dist, ml - copied);
-                memcpy(dp + copied, sp + copied, chunk);
-                copied += chunk;
-                if (dist < 64u && copied == dist) {
-                    while (copied < ml) {
-                        uint32_t dbl = std::min(copied, ml - copied);
-                        memcpy(dp + copied, dp, dbl);
-                        copied += dbl;
-                    }
-                    break;
-                }
+#if defined(__aarch64__)
+            if (out_end <= out_safe) {
+                uint8x16_t v = vdupq_n_u8(sp[0]);
+                uint32_t k = 0u;
+                do {
+                    vst1q_u8(dp + k, v);
+                    k += 16u;
+                } while (k < ml);
+            } else {
+                memset(dp, sp[0], ml);
             }
+#else
+            memset(dp, sp[0], ml);
+#endif
+        } else if (dist == 2u && out_end <= out_safe) {
+#if defined(__aarch64__)
+            uint16_t pat;
+            memcpy(&pat, sp, 2u);
+            uint16x8_t v = vdupq_n_u16(pat);
+            uint32_t k = 0u;
+            do {
+                vst1q_u8(dp + k, vreinterpretq_u8_u16(v));
+                k += 16u;
+            } while (k < ml);
+#else
+            for (uint32_t k = 0u; k < ml; ++k) dp[k] = sp[k];
+#endif
+        } else if (dist == 4u && out_end <= out_safe) {
+#if defined(__aarch64__)
+            uint32_t pat;
+            memcpy(&pat, sp, 4u);
+            uint32x4_t v = vdupq_n_u32(pat);
+            uint32_t k = 0u;
+            do {
+                vst1q_u8(dp + k, vreinterpretq_u8_u32(v));
+                k += 16u;
+            } while (k < ml);
+#else
+            for (uint32_t k = 0u; k < ml; ++k) dp[k] = sp[k];
+#endif
+        } else {
+            for (uint32_t k = 0u; k < ml; ++k) dp[k] = sp[k];
         }
-        out_pos += ml;
+        out_pos = out_end;
     }
 
-    uint32_t tail = meta.tail_lit_size;
-    if (lit_pos + tail != meta.lit_size || out_pos + tail != raw_size) return false;
+    const uint32_t tail = meta.tail_lit_size;
+    if (__builtin_expect((lit_pos + tail != lit_size) | (out_pos + tail != raw_size), 0))
+        return false;
     if (tail > 0u) memcpy(dst + out_pos, lit + lit_pos, tail);
     return true;
 }

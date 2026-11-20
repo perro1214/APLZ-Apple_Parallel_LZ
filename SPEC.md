@@ -11,7 +11,7 @@ APLZ v4 は Apple Silicon（M1〜M4+）のハードウェア構造から逆算�
 ### 1.1 中核原則
 1. **UMA（Unified Memory Architecture）真・異種協調**:
    - GPU 単騎に逐次 LZ パースを押し付けず、**CPU 全コア（256 KiB 分離ストリーム LZ パース・NEON 前処理・FastCDC 重複排除・HW CRC32C）** と **Apple GPU（32-way SIMD-group rANS バッチ符号化・復号）** を `MTLResourceStorageModeShared`（ゼロコピー UMA 共有バッファ）上の 3 スロット非同期パイプラインで連結し、全シリコンを同時稼働させる。
-   - **Zero-Cold-Start Hybrid 実行**: 単発の小〜中規模データ（`< 96 MiB`）では Metal GPU 起動遅延（約 30–60 ms）を避け、GPU と 100% ビット完全一致する **CPU 全コア ブランチレス 32-way rANS** で遅延 0 ms から即座に稼働する。大規模データ（`>= 96 MiB`）ではバックグラウンドで非同期 Metal 初期化を進め、完了次第ゼロ停止で GPU rANS へ自動シームレス切替する。
+   - **Zero-Cold-Start Hybrid 実行**: 単発の小〜中規模データ（`< 384 MiB`）では Metal GPU 起動遅延（約 30–60 ms）を避け、GPU と 100% ビット完全一致する **CPU 全コア ブランチレス 32-way rANS（64-bit 1 乗算符号化 / NEON `vqtbl1q_u8` 復号）** で遅延 0 ms から即座に稼働する。大規模データ（`>= 384 MiB`）ではバックグラウンドで非同期 Metal 初期化を進め、完了次第ゼロ停止で GPU rANS へ自動シームレス切替する。
 2. **Apple Silicon「32-way 対称性」**:
    - Apple GPU のネイティブ SIMD-group 幅 = **32**。
    - Apple CPU（ARM64）の 128-bit NEON レジスタ数 = **32 本**（32 レーンの 32-bit rANS 状態が `uint32x4_t × 8` = 8 レジスタに完全常駐）。
@@ -60,7 +60,7 @@ APLZ v4 は Apple Silicon（M1〜M4+）のハードウェア構造から逆算�
 2. **状態更新**:
    $$q = \lfloor x_l / f_s \rfloor, \quad r = x_l - q \cdot f_s$$
    $$x_l \leftarrow (q \ll 12) + \text{cdf}[s] + r$$
-   - 除算回避には Granlund-Montgomery 32-bit 逆数乗算を用いる（$f_s \ge 2$ に対し $k = \lfloor \log_2(f_s - 1) \rfloor$, $m = \lfloor 2^{32}(2^{k+1} - f_s)/f_s \rfloor + 1$, $t = \text{mulhi}(x_l, m)$, $q = (t + ((x_l - t) \gg 1)) \gg k$。全 $f_s \in [2, 4095]$ と全 `uint32_t` 範囲で厳密一致を検証済み）。
+   - 除算回避には、GPU 側で Granlund-Montgomery 32-bit 逆数乗算（$f_s \ge 2$ に対し $k = \lfloor \log_2(f_s - 1) \rfloor$, $m = \lfloor 2^{32}(2^{k+1} - f_s)/f_s \rfloor + 1$, $t = \text{mulhi}(x_l, m)$, $q = (t + ((x_l - t) \gg 1)) \gg k$）を用い、CPU 高速エンコーダ（`rans32_encode_tile_fast`）では全 $f_s \in [1, 4095]$ に対し分岐ゼロで厳密一致する 64-bit 1 乗算式 $q = \lfloor (x_l \cdot \lceil 2^{44} / f_s \rceil) / 2^{44} \rfloor$ および $x_l \leftarrow (x_l + \text{cdf}[s]) + q \cdot (4096 - f_s)$ を用いる（全 $f_s \in [1, 4095]$・全有効 $x_l < f_s \cdot 2^{20}$ でオーバーフローなし・厳密一致を検証済み）。
 
 #### デコード遷移（順方向: `step = 0` → `S-1`）
 初期状態: ヘッダから `x_l = final_state[l]` をロード。
@@ -160,11 +160,11 @@ Slot N   (Write Queue):[厳密順序保証・適応並列ゼロ中間コピー�
 ```
 
 - **Zero-Cold-Start Hybrid ポリシー**:
-  - 入力 `< 96 MiB`（`HYBRID_GPU_MIN_BYTES` 未満）かつ Metal 未初期化時: Metal を起動せず、**CPU 全コア ブランチレス 32-way rANS**（`rans32_encode_tile_fast`）で 0 ms 起動遅延のまま処理する。`n_tiles > n_streams && n_streams < 64` の場合はタイル単位並列に自動切替する。
-  - 入力 `>= 96 MiB` 時: 先頭スロットを CPU rANS で即座に処理開始しつつバックグラウンドスレッドで `ensure_gpu_encode()` を非同期実行し、完了したスロットから自動的に Metal GPU バッチ（`hx_rans_batch_build` + `hx_rans_batch_encode`）へ無停止切替する。
+  - 入力 `< 384 MiB`（`HYBRID_GPU_MIN_BYTES` 未満）かつ Metal 未初期化時: Metal を起動せず、**CPU 全コア ブランチレス 32-way rANS**（`rans32_encode_tile_fast`、64-bit 1 乗算 4-way ILP）で 0 ms 起動遅延のまま処理する。`n_tiles > n_streams && n_streams < 64` の場合はタイル単位並列に自動切替する。
+  - 入力 `>= 384 MiB` 時: 先頭スロットを CPU rANS で即座に処理開始しつつバックグラウンドスレッド（`warmup_gpu_encode_async()`、`QOS_CLASS_USER_INITIATED`）で非同期 Metal 初期化を進め、完了したスロットから自動的に Metal GPU バッチ（`hx_rans_batch_build` + `hx_rans_batch_encode`）へ無停止切替する。
   - GPU エンコード／デコードとも、バッチごとの Metal コマンド投入を `@autoreleasepool` で囲み、GB 級ストリーミングでも Objective-C 一時オブジェクトが蓄積しない構造としている。
 - **ゼロコピー ARM64 NEON 並列デコード & 2 スロット非同期 GPU デコード (`DEC_SLOTS = 2`, `OUT_WR_SLOTS = 3`)**:
-  - 単発 CLI 復号では、非アライン 16-bit ロード対応のゼロコピー 32-way NEON 復号（`rans32_decode_tile_neon_bytes`）＋タイル単位マルチコア並列展開＋3 スロット非同期ファイル書出（`OUT_WR_SLOTS = 3`）により、Metal 起動遅延と中間コピーをゼロ化する。
+  - 単発 CLI 復号では、32 レーンを NEON レジスタ群 `uint32x4_t × 8` に常駐させたまま `vqtbl1q_u8` による全レーン並列リフィルを行うゼロコピー 32-way NEON 復号（`rans32_decode_tile_neon_bytes`）＋スレッドローカル 16 KB L1D 常駐 LUT 融合構築（NEON 4 要素並列 `rans32_read_freq_table_to_lut`）＋3 スロット非同期ファイル書出（`OUT_WR_SLOTS = 3`）により、Metal 起動遅延・L2 キャッシュスラッシング・中間コピーをゼロ化する。
   - 常駐 GPU デコード有効時は、Slot `N+1` の GPU 32-way rANS 復号（`hx_rans_batch_decode`）を非同期投入しながら、CPU 全コアで Slot `N` の LZ 展開 + NEON 逆前処理 + HW CRC32C 検証を実行し、CPU/GPU を完全並列化する。
 
 ### 3.2 適応前処理（OpenZL 型軽量 DAG）とプローブ
@@ -189,10 +189,11 @@ Slot N   (Write Queue):[厳密順序保証・適応並列ゼロ中間コピー�
 
 - **最小マッチ長**: `HX_MIN_MATCH = 4`
 - **圧縮レベル**:
-  - **Level 1 (`-1`)**: 高速 1-probe ハッシュ（`15-bit` テーブル）、rep-offset 優先、高速スキップ。
-  - **Level 3 (`-3`, default)**: バランス型 1-step lazy match（閾値 32）、`rep0/rep1/rep2` 最適化、後方延長（backward extend）。
+  - **Level 1 (`-1`)**: 高速 1-probe ハッシュ（`14-bit` テーブル＋6-bit タグ = 実効 20-bit フィルタ）、`anchor` 先行ハッシュ＋ループ外 `rep0` 高速パス、高速スキップ。
+  - **Level 3 (`-3`, default)**: 64-bit 1-load / 1-store 2-way バケット（`15-bit × 2`＋6-bit タグ = 実効 21-bit フィルタ）、末尾バイト先行フィルタ付き 1-step lazy match（閾値 32）、`rep0/rep1/rep2` 最適化、後方延長（backward extend）。
   - **Level 6 (`-6`)**: 2-way バケット（`15-bit × 2`）+ lazy match による高圧縮モード。
-- **エポック・ハッシュテーブル**: `thread_local HxLzThreadState` を遅延確保し、ブロックごとにベースオフセット（epoch）を進めることで、256 KiB ブロック毎の `memset` を完全に排除している。
+- **タグ付きエポック・ハッシュテーブル**: `thread_local HxLzThreadState` を遅延確保し、各エントリに `[epoch:8 | hash_tag:6 | pos:18]` をパック。ブロックごとにエポックを進めることで 256 KiB ブロック毎の `memset` を完全に排除しつつ、ハッシュ衝突による不要なランダムメモリアクセスの約 98.4% を `XOR+CMP` 1 発で事前棄却する。
+- **高速 LZ デコーダ (`hx_lz_decode_block`)**: 結合デコードテーブル（`LL_DEC` / `ML_DEC` / `OF_DEC`）、無条件 64-bit ブランチレス `ExtraBits` ロード、`ll <= 16` / `ml <= 16 && dist >= 16` の 16 バイト固定 `wildcopy` 高速パス、および `dist == 1/2/4` の NEON `vdupq` RLE 展開を実装。
 - **シンボル空間**:
   - `Literals` (8-bit 生リテラル列)
   - `LL` (Literal Length コード: `0..36` の 37 値。`0..15` は追加ビットなし、`16..36` は `1..17` extra bits で `0..262,187` を完全表現)
@@ -285,12 +286,12 @@ Phase 3（`src/archive/`）は、一時 `.tar` ファイルを完全に廃止し
 - `3` (`MEDIA`): 既圧縮メディア・アーカイブ（PNG / JPEG / MP4 / ZIP / GZ / ZST / PDF 等）
 - `4` (`BIN`): その他一般バイナリ
 
-#### 正規化 FastCDC（`asz_fastcdc.h`）
+#### 正規化 FastCDC（`aplz_fastcdc.h`）
 - **パラメータ**: `min = 16 KiB`、`normal = 64 KiB`、`max = 256 KiB`（Phase 2 ブロックサイズに一致）
 - **Gear Hash マスク**:
   - `[16 KiB, 64 KiB)`: `ASZ_CDC_MASK_S = 0x0007590703530000ULL`（厳密 16 bit）
   - `[64 KiB, 256 KiB)`: `ASZ_CDC_MASK_L = 0x0003590303530000ULL`（厳密 14 bit）
-  - 4 バイト展開ループにより 1 バイト粒度カット判定と完全同一のカット位置を 4 倍少ない分岐で算出。
+  - 32-bit 一括ロードと並列加算ツリー（`fp4 = (fp << 4) + (((g0 << 1) + g1) << 2) + ((g2 << 1) + g3)`）により、1 バイト粒度カット判定と 100% ビット同一のカット位置をループ依存長 1 命令で高速算出。
 - **マルチコア並列化**: `>= 8 MiB` の大ファイルは 8 MiB スーパースライス単位で全 CPU コア並列チャンク分割を実行する。
 - **160-bit 強コンテンツ指紋**: 1 パス 32 B ロードで `wyhash128`（`hash_lo`, `hash_hi`）と ARM64 ハードウェア `__crc32cd`（`crc32c`）を同時計算し、`(hash_lo, hash_hi, raw_size, crc32c)` で重複判定する。
 
@@ -369,7 +370,7 @@ Phase 3（`src/archive/`）は、一時 `.tar` ファイルを完全に廃止し
 2. **256 KiB ブロック単位 O(1) 部分展開 (`aplz x archive.aplz -C out <path>`)**:
    - 指定ファイルが参照する Extent の `(pack_id, offset_in_pack, length)` のみを抽出し、`HeteroEngine::decompress_range` で該当 256 KiB ブロックだけを選択復号する（例: 128 MiB パック内の 128 KiB ファイルでも 1 ブロック = 256 KiB のみ復号、0.3 ms 未満）。
 3. **パック順序最適化・並列ファイル書出・ゼロバッファ直展開**:
-   - 全展開 (`extract`) および検証 (`verify`) では、対象ファイルを `(first_pack_id, offset_in_pack)` 順にソートし、同一 Pack 内の複数ファイル（Solid Pack 等）は全 CPU コア並列で `open(O_EXCL|O_NOFOLLOW)` + `fchmod` + `futimens` 書出を行う。
+   - 全展開 (`extract`) および検証 (`verify`) では、対象ファイルを `(first_pack_id, offset_in_pack)` 順にソートし、同一 Pack 内の複数ファイル（Solid Pack 等）は APFS ディレクトリ vnode ロック競合を回避する 4 ワーカー並列ワークスティーリングで書出を行う。`umask` 事前キャッシュによる不要 `fchmod` 省略と、同一パック内連続エクステントのゼロコピー `fwrite` 結合も実施する。
    - 非共有の連続大パックでは、`extract` / `extract_single_file` 双方で APFS `F_PREALLOCATE` + 3 スロット非同期ストリーミング直書出を行い、`verify` でも出力バッファ確保ゼロのストリーミング検証を実行する。
 4. **3 重破損検知 (`aplz t` / 展開時自動検証)**:
    - Layer 1: `AszFileHeader.header_crc32c` + `Central Directory` の `ASZ2` ブロック CRC32C
@@ -389,28 +390,28 @@ Phase 3（`src/archive/`）は、一時 `.tar` ファイルを完全に廃止し
 
 | ツール | 圧縮後サイズ (圧縮率) | 圧縮速度 (時間) | 解凍 `d` (時間) | 展開 `x` (時間) | 整合性検査 (`t`) | 一覧 (`l`) |
 |---|---:|---:|---:|---:|---:|---:|
-| **`aplz -1` (fast)** | **391.6 MiB (38.25%)** | **3,010 MB/s (0.34 s)** | **3,450 MB/s (0.30 s)** | **3,192 MB/s (0.32 s)** | **0.14 s** (7,066 MB/s) | **4.6 ms** |
-| **`aplz -3` (default)** | **384.5 MiB (37.55%)** | **2,797 MB/s (0.37 s)** | **3,496 MB/s (0.29 s)** | **3,355 MB/s (0.31 s)** | **0.15 s** (7,020 MB/s) | **4.4 ms** |
-| `aplz -1 --no-dedup` | 595.1 MiB (58.11%) | 2,417 MB/s (0.42 s) | 3,290 MB/s (0.31 s) | 2,852 MB/s (0.36 s) | 0.22 s (4,692 MB/s) | 4.1 ms |
-| `zstd -3 -T0` | 677.9 MiB (66.20%) | 2,153 MB/s (0.48 s) | 1,204 MB/s (0.85 s) | — | — | — |
+| **`aplz -1` (fast)** | **391.6 MiB (38.24%)** | **3,297 MB/s (0.31 s)** | **3,566 MB/s (0.29 s)** | **3,109 MB/s (0.33 s)** | **0.12 s** (8,403 MB/s) | **3.9 ms** |
+| **`aplz -3` (default)** | **384.7 MiB (37.56%)** | **3,207 MB/s (0.32 s)** | **3,438 MB/s (0.30 s)** | **3,657 MB/s (0.28 s)** | **0.12 s** (8,768 MB/s) | **3.7 ms** |
+| `aplz -1 --no-dedup` | 595.2 MiB (58.12%) | 2,642 MB/s (0.39 s) | 3,120 MB/s (0.33 s) | 2,662 MB/s (0.38 s) | 0.14 s (7,421 MB/s) | 4.7 ms |
+| `zstd -3 -T0` | 677.9 MiB (66.20%) | 2,003 MB/s (0.51 s) | 1,263 MB/s (0.81 s) | — | — | — |
 
 ### 5.2 979 ファイル実ディレクトリ（`ml_project`, 89.4 MiB、エンドツーエンド CLI）
 
 | ツール | アーカイブサイズ (比率) | 作成 (Pack) | 全展開 (Full) | 一覧 (List) | 1 ファイル部分展開 |
 |---|---:|---:|---:|---:|---:|
-| **`aplz -1`** | **12.39 MiB (13.9%)** | **49.1 ms** | **76.0 ms** | **2.9 ms** | **3.23 ms** |
-| **`aplz -3`** | **12.32 MiB (13.8%)** | **49.8 ms** | **76.3 ms** | **3.0 ms** | **3.19 ms** |
-| `tar + zstd -1 -T0` | 33.08 MiB (37.0%) | 346.5 ms | 364.3 ms | 47.0 ms | 46.17 ms |
-| `tar + zstd -3 -T0` | 32.39 MiB (36.2%) | 373.1 ms | 368.1 ms | 58.0 ms | 57.63 ms |
-| `tar + lz4 -1` | 47.97 MiB (53.7%) | 380.5 ms | 366.3 ms | 42.1 ms | 41.28 ms |
+| **`aplz -1`** | **12.39 MiB (13.9%)** | **43.9 ms** | **61.7 ms** | **3.0 ms** | **3.13 ms** |
+| **`aplz -3`** | **12.33 MiB (13.8%)** | **46.5 ms** | **61.5 ms** | **2.9 ms** | **3.08 ms** |
+| `tar + zstd -1 -T0` | 33.07 MiB (37.0%) | 338.9 ms | 355.5 ms | 47.0 ms | 46.03 ms |
+| `tar + zstd -3 -T0` | 32.39 MiB (36.2%) | 357.4 ms | 353.3 ms | 58.2 ms | 57.36 ms |
+| `tar + lz4 -1` | 47.97 MiB (53.7%) | 371.5 ms | 354.0 ms | 41.8 ms | 41.02 ms |
 
 ### 5.3 Phase 2 コア（64 MiB インメモリ、定常スループット）
 
 | データセット (64 MiB) | `aplz` L1 圧縮率 / 圧縮 / 解凍 | `aplz` L3 圧縮率 / 圧縮 / 解凍 | `aplz` L6 圧縮率 / 圧縮 / 解凍 |
 |---|---:|---:|---:|
-| `Source+Docs` | 28.6% / 2,746 / 3,354 MB/s | 26.3% / 1,537 / 3,410 MB/s | 24.5% / 1,072 / 4,050 MB/s |
-| `Mach-O ARM64` | 43.8% / 2,280 / 3,356 MB/s | 41.4% / 1,167 / 3,570 MB/s | 40.0% / 729 / 3,006 MB/s |
-| `FP16 Weights` | 84.1% / **8,997 / 8,090 MB/s** | 84.1% / **8,997 / 8,090 MB/s** | 84.1% / **8,997 / 8,090 MB/s** |
-| `FP32 Telemetry` | 40.9% / 4,593 / 6,505 MB/s | 38.0% / 2,823 / 6,237 MB/s | 36.9% / 987 / 6,788 MB/s |
-| `Mixed Real` | 64.0% / 3,332 / 3,559 MB/s | 62.8% / 2,231 / 3,969 MB/s | 62.0% / 1,500 / 3,863 MB/s |
-| `Random` | 100.0% / **23,272 / 27,357 MB/s** | 100.0% / **23,272 / 27,357 MB/s** | 100.0% / **23,272 / 27,357 MB/s** |
+| `Source+Docs` | 26.6% / 3,249 / 6,931 MB/s | 24.3% / 2,331 / 4,701 MB/s | 22.2% / 1,156 / 5,041 MB/s |
+| `Mach-O ARM64` | 43.8% / 2,650 / 4,967 MB/s | 41.5% / 1,682 / 3,866 MB/s | 40.0% / 746 / 5,194 MB/s |
+| `FP16 Weights` | 84.1% / **8,454 / 7,873 MB/s** | 84.1% / **8,790 / 7,831 MB/s** | 84.1% / **8,668 / 7,471 MB/s** |
+| `FP32 Telemetry` | 41.0% / 5,238 / 9,552 MB/s | 38.3% / 3,321 / **12,455 MB/s** | 36.9% / 1,020 / **13,270 MB/s** |
+| `Mixed Real` | 63.5% / 4,572 / 7,808 MB/s | 62.3% / 3,276 / 6,635 MB/s | 61.4% / 1,586 / 4,633 MB/s |
+| `Random` | 100.0% / **23,490 / 28,010 MB/s** | 100.0% / **24,014 / 28,479 MB/s** | 100.0% / **23,980 / 28,880 MB/s** |
