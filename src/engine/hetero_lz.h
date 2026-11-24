@@ -154,7 +154,22 @@ static inline void hx_neon_transform_forward(const uint8_t* __restrict src, uint
     }
     if (xform_id == HX_XFORM_ARM64_BCJ) {
         uint32_t cnt = n >> 2u;
-        for (uint32_t i = 0u; i < cnt; ++i) {
+        uint32_t i = 0u;
+#if defined(__aarch64__)
+        const uint32x4_t v_opmask = vdupq_n_u32(0xFC000000u);
+        const uint32x4_t v_blop   = vdupq_n_u32(0x94000000u);
+        const uint32x4_t v_immask = vdupq_n_u32(0x03FFFFFFu);
+        const uint32x4_t v_step4  = vdupq_n_u32(4u);
+        uint32x4_t v_idx = { 0u, 1u, 2u, 3u };
+        for (; i + 4u <= cnt; i += 4u) {
+            uint32x4_t inst = vld1q_u32((const uint32_t*)(src + i * 4u));
+            uint32x4_t is_bl = vceqq_u32(vandq_u32(inst, v_opmask), v_blop);
+            uint32x4_t conv  = vorrq_u32(v_blop, vandq_u32(vaddq_u32(inst, v_idx), v_immask));
+            vst1q_u32((uint32_t*)(dst + i * 4u), vbslq_u32(is_bl, conv, inst));
+            v_idx = vaddq_u32(v_idx, v_step4);
+        }
+#endif
+        for (; i < cnt; ++i) {
             uint32_t inst;
             memcpy(&inst, src + i * 4u, 4u);
             if ((inst & 0xFC000000u) == 0x94000000u) {
@@ -184,7 +199,22 @@ static inline void hx_neon_transform_inverse(const uint8_t* __restrict src, uint
     }
     if (xform_id == HX_XFORM_ARM64_BCJ) {
         uint32_t cnt = n >> 2u;
-        for (uint32_t i = 0u; i < cnt; ++i) {
+        uint32_t i = 0u;
+#if defined(__aarch64__)
+        const uint32x4_t v_opmask = vdupq_n_u32(0xFC000000u);
+        const uint32x4_t v_blop   = vdupq_n_u32(0x94000000u);
+        const uint32x4_t v_immask = vdupq_n_u32(0x03FFFFFFu);
+        const uint32x4_t v_step4  = vdupq_n_u32(4u);
+        uint32x4_t v_idx = { 0u, 1u, 2u, 3u };
+        for (; i + 4u <= cnt; i += 4u) {
+            uint32x4_t inst = vld1q_u32((const uint32_t*)(src + i * 4u));
+            uint32x4_t is_bl = vceqq_u32(vandq_u32(inst, v_opmask), v_blop);
+            uint32x4_t conv  = vorrq_u32(v_blop, vandq_u32(vsubq_u32(inst, v_idx), v_immask));
+            vst1q_u32((uint32_t*)(dst + i * 4u), vbslq_u32(is_bl, conv, inst));
+            v_idx = vaddq_u32(v_idx, v_step4);
+        }
+#endif
+        for (; i < cnt; ++i) {
             uint32_t inst;
             memcpy(&inst, src + i * 4u, 4u);
             if ((inst & 0xFC000000u) == 0x94000000u) {
@@ -293,13 +323,11 @@ static inline HxProbeResult hx_probe_block(const uint8_t* data, uint32_t len) {
         }
     }
 
-    // 2) 4 KiB サンプル (先頭 2 KiB + 中央 2 KiB) を 1 パス解析
+    // 2) 4 KiB サンプル (先頭 2 KiB + 中央 2 KiB) を 1 パス解析 (cnt_s4 のみ集計→NEON で cnt_s2/cnt_all 合成!)
     const uint32_t seg = std::min(2048u, len >> 1u);
     const uint32_t sample_len = (seg * 2u) & ~3u;
     const uint8_t* segs[2] = { data, data + ((len >> 1u) & ~3u) };
 
-    uint32_t cnt_all[256] = {};
-    uint32_t cnt_s2[2][256] = {};
     uint32_t cnt_s4[4][256] = {};
     uint32_t bl_hits = 0u;
     uint32_t total_inst = 0u;
@@ -313,14 +341,10 @@ static inline HxProbeResult hx_probe_block(const uint8_t* data, uint32_t len) {
         uint32_t sl = seg & ~3u;
         for (uint32_t i = 0u; i < sl; i += 4u) {
             uint32_t w = hx_read32(sp + i);
-            uint8_t c0 = (uint8_t)(w & 0xFFu);
-            uint8_t c1 = (uint8_t)((w >> 8u) & 0xFFu);
-            uint8_t c2 = (uint8_t)((w >> 16u) & 0xFFu);
-            uint8_t c3 = (uint8_t)((w >> 24u) & 0xFFu);
-
-            cnt_all[c0]++; cnt_all[c1]++; cnt_all[c2]++; cnt_all[c3]++;
-            cnt_s2[0][c0]++; cnt_s2[1][c1]++; cnt_s2[0][c2]++; cnt_s2[1][c3]++;
-            cnt_s4[0][c0]++; cnt_s4[1][c1]++; cnt_s4[2][c2]++; cnt_s4[3][c3]++;
+            cnt_s4[0][ w         & 0xFFu]++;
+            cnt_s4[1][(w >>  8u) & 0xFFu]++;
+            cnt_s4[2][(w >> 16u) & 0xFFu]++;
+            cnt_s4[3][(w >> 24u) & 0xFFu]++;
 
             if ((w & 0xFC000000u) == 0x94000000u) {
                 uint32_t hi4 = (w >> 22u) & 0xFu;
@@ -334,6 +358,30 @@ static inline HxProbeResult hx_probe_block(const uint8_t* data, uint32_t len) {
             seen_val[h] = w;
         }
     }
+
+    uint32_t cnt_s2[2][256];
+    uint32_t cnt_all[256];
+#if defined(__aarch64__)
+    for (uint32_t i = 0u; i < 256u; i += 4u) {
+        uint32x4_t v0 = vld1q_u32(cnt_s4[0] + i);
+        uint32x4_t v1 = vld1q_u32(cnt_s4[1] + i);
+        uint32x4_t v2 = vld1q_u32(cnt_s4[2] + i);
+        uint32x4_t v3 = vld1q_u32(cnt_s4[3] + i);
+        uint32x4_t s0 = vaddq_u32(v0, v2);
+        uint32x4_t s1 = vaddq_u32(v1, v3);
+        vst1q_u32(cnt_s2[0] + i, s0);
+        vst1q_u32(cnt_s2[1] + i, s1);
+        vst1q_u32(cnt_all + i, vaddq_u32(s0, s1));
+    }
+#else
+    for (uint32_t i = 0u; i < 256u; ++i) {
+        uint32_t s0 = cnt_s4[0][i] + cnt_s4[2][i];
+        uint32_t s1 = cnt_s4[1][i] + cnt_s4[3][i];
+        cnt_s2[0][i] = s0;
+        cnt_s2[1][i] = s1;
+        cnt_all[i]   = s0 + s1;
+    }
+#endif
 
     const float* tbl = hx_get_nlog2n_table();
     float h_all  = hx_calc_entropy_fast(cnt_all, sample_len, tbl);
@@ -439,7 +487,7 @@ struct HxLzThreadState {
     uint32_t* ht_high = nullptr; // [1<<15][4]
     uint32_t  ep_fast = 0u;      // 1..255 (上位 8 bit へシフト)
     uint32_t  ep_def  = 0u;      // 1..255 (上位 8 bit へシフト)
-    uint32_t  ep_high = HX_BLOCK_SIZE;
+    uint32_t  ep_high = 0u;      // 1..255 (上位 8 bit へシフト)
     HxRawBuf  xtmp; // LZ+Xform 時のみ遅延確保 (256 KiB)
 
     ~HxLzThreadState() {
@@ -478,18 +526,18 @@ struct HxLzThreadState {
         return ht_def;
     }
 
-    uint32_t* acquire_high(uint32_t& out_ep) {
+    uint32_t* acquire_high(uint32_t& out_ep_hi) {
         if (!ht_high) {
             ht_high = (uint32_t*)calloc((size_t)(1u << HBITS_HIGH) * 4u, sizeof(uint32_t));
-            ep_high = HX_BLOCK_SIZE;
+            ep_high = 1u;
         } else {
-            ep_high += HX_BLOCK_SIZE;
-            if (ep_high > 0xF0000000u) {
+            ep_high++;
+            if (ep_high >= 256u) {
                 memset(ht_high, 0, (size_t)(1u << HBITS_HIGH) * 4u * sizeof(uint32_t));
-                ep_high = HX_BLOCK_SIZE;
+                ep_high = 1u;
             }
         }
-        out_ep = ep_high;
+        out_ep_hi = ep_high << 24u;
         return ht_high;
     }
 
@@ -838,50 +886,56 @@ static inline bool hx_lz_encode_block(
             anchor = pos;
         }
     } else {
-        // ── Level 6 (--high): 4-way 32K エポックハッシュ + 2-step Lazy + 末尾バイト弾き + 挿入上限 ──
-        uint32_t ep;
-        uint32_t* __restrict ht = ts.acquire_high(ep);
+        // ── Level 6 (--high): 4-way 32K タグ付きエポックハッシュ (実効 21-bit) + 2-step Lazy ──
+        uint32_t ep_hi;
+        uint32_t* __restrict ht = ts.acquire_high(ep_hi);
 
         auto insert4 = [&](uint32_t p) {
-            uint32_t idx = hx_hash4(hx_read32(src + p), HxLzThreadState::HBITS_HIGH) << 2u;
-            ht[idx + 3u] = ht[idx + 2u];
-            ht[idx + 2u] = ht[idx + 1u];
-            ht[idx + 1u] = ht[idx];
-            ht[idx]      = ep + p;
+            uint32_t hv     = hx_read32(src + p) * 2654435761u;
+            uint32_t idx    = (hv >> (32u - HxLzThreadState::HBITS_HIGH)) << 2u;
+            uint32_t expect = ep_hi | ((hv & 0x0001F800u) << 7u);
+            uint32_t c0 = ht[idx], c1 = ht[idx + 1u], c2 = ht[idx + 2u];
+            ht[idx + 3u] = c2;
+            ht[idx + 2u] = c1;
+            ht[idx + 1u] = c0;
+            ht[idx]      = expect | p;
         };
         auto match_score = [&](uint32_t ml, uint32_t d) -> int32_t {
             if (ml < HX_MIN_MATCH) return -1000;
             int32_t cost_bits = (d == rep0) ? 2 : (d == rep1 || d == rep2) ? 4 : (int32_t)(31 - __builtin_clz(d)) + 5;
             return (int32_t)(ml * 7u) - cost_bits;
         };
-        auto find4 = [&](uint32_t p, uint32_t& out_len, uint32_t& out_dist) {
+        auto find4 = [&](uint32_t p, bool check_rep, uint32_t& out_len, uint32_t& out_dist) {
             uint64_t cur8 = hx_read64(src + p);
             uint32_t cur4 = (uint32_t)cur8;
             out_len = 0u; out_dist = 0u;
             int32_t best_sc = -1000;
-            uint32_t reps[3] = { rep0, rep1, rep2 };
-            for (int r = 0; r < 3; ++r) {
-                uint32_t d = reps[r];
-                if (p >= d) {
-                    uint64_t rd = hx_read64(src + p - d) ^ cur8;
-                    if ((uint32_t)rd == 0u) {
-                        uint32_t ml = hx_match_len_from_diff8(rd, src + p - d, src + p, len - p);
-                        int32_t sc = match_score(ml, d);
-                        if (sc > best_sc) { best_sc = sc; out_len = ml; out_dist = d; }
+            if (__builtin_expect(check_rep, 0)) {
+                uint32_t reps[3] = { rep0, rep1, rep2 };
+                for (int r = 0; r < 3; ++r) {
+                    uint32_t d = reps[r];
+                    if (p >= d) {
+                        uint64_t rd = hx_read64(src + p - d) ^ cur8;
+                        if ((uint32_t)rd == 0u) {
+                            uint32_t ml = hx_match_len_from_diff8(rd, src + p - d, src + p, len - p);
+                            int32_t sc = match_score(ml, d);
+                            if (sc > best_sc) { best_sc = sc; out_len = ml; out_dist = d; }
+                        }
                     }
                 }
             }
-            uint32_t idx = hx_hash4(cur4, HxLzThreadState::HBITS_HIGH) << 2u;
+            uint32_t hv     = cur4 * 2654435761u;
+            uint32_t idx    = (hv >> (32u - HxLzThreadState::HBITS_HIGH)) << 2u;
+            uint32_t expect = ep_hi | ((hv & 0x0001F800u) << 7u);
             uint32_t c0 = ht[idx], c1 = ht[idx + 1u], c2 = ht[idx + 2u], c3 = ht[idx + 3u];
-            ht[idx + 3u] = c2; ht[idx + 2u] = c1; ht[idx + 1u] = c0; ht[idx] = ep + p;
+            ht[idx + 3u] = c2; ht[idx + 2u] = c1; ht[idx + 1u] = c0; ht[idx] = expect | p;
 
             if (out_len >= 64u) return;
 
-            uint32_t rels[4] = { c0 - ep, c1 - ep, c2 - ep, c3 - ep };
+            uint32_t rels[4] = { c0 ^ expect, c1 ^ expect, c2 ^ expect, c3 ^ expect };
             for (int k = 0; k < 4; ++k) {
                 uint32_t rel = rels[k];
                 if (rel < p) {
-                    // 末尾バイト弾き (既に 8B 以上の長マッチがあるときのみ即棄却)
                     if (out_len >= 8u && p + out_len - 1u < len && src[rel + out_len - 1u] != src[p + out_len - 1u]) {
                         continue;
                     }
@@ -899,16 +953,18 @@ static inline bool hx_lz_encode_block(
         insert4(0u);
         while (pos < mflimit) {
             uint32_t mlen, mdist;
-            find4(pos, mlen, mdist);
+            find4(pos, (pos < anchor + 8u), mlen, mdist);
             if (mlen < HX_MIN_MATCH) { pos++; continue; }
-
+            uint32_t lazy_done = 0u;
             for (int lazy = 0; lazy < 2 && pos + 1u < mflimit && mlen < 128u; ++lazy) {
                 uint32_t nlen, ndist;
-                find4(pos + 1u, nlen, ndist);
+                find4(pos + 1u, true, nlen, ndist);
+                lazy_done = 1u;
                 if (match_score(nlen, ndist) > match_score(mlen, mdist) + 5) {
                     pos++;
                     mlen = nlen;
                     mdist = ndist;
+                    lazy_done = 0u;
                 } else {
                     break;
                 }
@@ -919,7 +975,7 @@ static inline bool hx_lz_encode_block(
             uint32_t end_pos = pos + mlen;
             uint32_t ins_lim = std::min(end_pos, mflimit);
             uint32_t ins_end = std::min(ins_lim, pos + 24u);
-            for (uint32_t q = pos + 1u; q < ins_end; ++q) insert4(q);
+            for (uint32_t q = pos + 1u + lazy_done; q < ins_end; ++q) insert4(q);
             if (ins_lim >= 2u && ins_lim - 2u >= ins_end) insert4(ins_lim - 2u);
             if (ins_lim >= 1u && ins_lim - 1u >= ins_end) insert4(ins_lim - 1u);
             pos = end_pos;

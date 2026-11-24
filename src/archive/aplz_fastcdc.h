@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <fcntl.h>
 #include <vector>
 #include <algorithm>
 #include <dispatch/dispatch.h>
@@ -215,7 +216,9 @@ static inline void asz_fastcdc_chunk_and_hash(
     const uint8_t*                 data,
     size_t                         size,
     bool                           enable_dedup,
-    std::vector<AszRawChunkSlice>& out_chunks
+    std::vector<AszRawChunkSlice>& out_chunks,
+    int                            advise_fd       = -1,
+    uint64_t                       advise_file_off = 0u
 ) {
     out_chunks.clear();
     if (size == 0u) return;
@@ -237,7 +240,7 @@ static inline void asz_fastcdc_chunk_and_hash(
         return;
     }
 
-    // 大ファイル (>= 16 MiB): 8 MiB スーパースライス単位で全コア並列 FastCDC (境界ロス最小 & 32 スライス並列)
+    // 大ファイル (>= 16 MiB): 8 MiB スーパースライス単位で並列 F_RDADVISE + 並列 FastCDC!
     const size_t SLICE_BYTES = 8ull * 1024ull * 1024ull;
     if (size >= SLICE_BYTES * 2u) {
         size_t n_slices = (size + SLICE_BYTES - 1u) / SLICE_BYTES;
@@ -247,6 +250,14 @@ static inline void asz_fastcdc_chunk_and_hash(
         dispatch_apply(n_slices, par_q, ^(size_t si) {
             size_t base = si * SLICE_BYTES;
             size_t end  = std::min(size, base + SLICE_BYTES);
+#if defined(__APPLE__) && defined(F_RDADVISE)
+            if (advise_fd >= 0) {
+                struct radvisory ra;
+                ra.ra_offset = (off_t)(advise_file_off + base);
+                ra.ra_count  = (int)(end - base);
+                (void)fcntl(advise_fd, F_RDADVISE, &ra);
+            }
+#endif
             auto& local = sc_ptr[si];
             local.reserve((end - base) / 48000u + 4u);
             size_t pos = base;
@@ -265,6 +276,14 @@ static inline void asz_fastcdc_chunk_and_hash(
             out_chunks.insert(out_chunks.end(), v.begin(), v.end());
         }
     } else {
+#if defined(__APPLE__) && defined(F_RDADVISE)
+        if (advise_fd >= 0) {
+            struct radvisory ra;
+            ra.ra_offset = (off_t)advise_file_off;
+            ra.ra_count  = (int)size;
+            (void)fcntl(advise_fd, F_RDADVISE, &ra);
+        }
+#endif
         out_chunks.reserve(size / 48000u + 4u);
         size_t pos = 0u;
         while (pos < size) {

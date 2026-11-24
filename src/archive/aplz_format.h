@@ -210,11 +210,17 @@ static inline uint8_t asz_classify_file(const std::string& path, const uint8_t* 
         ext == "aac" || ext == "m4a" || ext == "flac" || ext == "ogg" || ext == "opus" ||
         ext == "zip" || ext == "gz" || ext == "tgz" || ext == "zst" || ext == "xz" ||
         ext == "bz2" || ext == "7z" || ext == "rar" || ext == "dmg" || ext == "pdf" ||
-        ext == "asz" || ext == "aplz" || ext == "lz4" || ext == "woff2") {
+        ext == "asz" || ext == "aplz" || ext == "lz4" || ext == "woff2" || ext == "woff" ||
+        ext == "pack" || ext == "jar" || ext == "whl" || ext == "epub" || ext == "apk" ||
+        ext == "ipa" || ext == "docx" || ext == "xlsx" || ext == "pptx" || ext == "webm" ||
+        ext == "avi" || ext == "m4v" || ext == "avif" || ext == "jxl" || ext == "br" ||
+        ext == "tbz2" || ext == "txz" || ext == "lzma" || ext == "deb" || ext == "rpm") {
         return ASZ_CLASS_MEDIA_COMP;
     }
     if (ext == "dylib" || ext == "so" || ext == "a" || ext == "o" || ext == "exe" ||
-        ext == "dll" || ext == "wasm" || ext == "metallib" || ext == "air") {
+        ext == "dll" || ext == "wasm" || ext == "metallib" || ext == "air" ||
+        ext == "pyc" || ext == "pyo" || ext == "pyd" || ext == "class" || ext == "node" ||
+        ext == "bundle") {
         return ASZ_CLASS_CODE;
     }
     if (ext == "fp16" || ext == "bf16" || ext == "fp32" || ext == "safetensors" ||
@@ -224,12 +230,18 @@ static inline uint8_t asz_classify_file(const std::string& path, const uint8_t* 
     }
     if (ext == "c" || ext == "cc" || ext == "cpp" || ext == "cxx" || ext == "h" || ext == "hpp" ||
         ext == "m" || ext == "mm" || ext == "metal" || ext == "swift" || ext == "rs" ||
-        ext == "go" || ext == "py" || ext == "js" || ext == "ts" || ext == "tsx" || ext == "jsx" ||
+        ext == "go" || ext == "py" || ext == "pyi" || ext == "pyx" || ext == "pxd" ||
+        ext == "js" || ext == "mjs" || ext == "cjs" || ext == "ts" || ext == "tsx" || ext == "jsx" ||
         ext == "java" || ext == "kt" || ext == "rb" || ext == "php" || ext == "sh" || ext == "zsh" ||
-        ext == "md" || ext == "txt" || ext == "json" || ext == "jsonl" || ext == "xml" ||
+        ext == "md" || ext == "txt" || ext == "rst" || ext == "tex" || ext == "bib" || ext == "sty" ||
+        ext == "json" || ext == "jsonl" || ext == "map" || ext == "ipynb" || ext == "xml" ||
         ext == "yaml" || ext == "yml" || ext == "toml" || ext == "ini" || ext == "cfg" ||
-        ext == "html" || ext == "htm" || ext == "css" || ext == "svg" || ext == "csv" ||
-        ext == "tsv" || ext == "sql" || ext == "log" || ext == "cmake" || ext == "gitignore") {
+        ext == "plist" || ext == "lock" || ext == "conf" || ext == "properties" || ext == "env" ||
+        ext == "html" || ext == "htm" || ext == "css" || ext == "scss" || ext == "sass" || ext == "less" ||
+        ext == "vue" || ext == "svelte" || ext == "svg" || ext == "csv" || ext == "tsv" ||
+        ext == "sql" || ext == "log" || ext == "cmake" || ext == "gitignore" || ext == "mk" ||
+        ext == "proto" || ext == "graphql" || ext == "r" || ext == "jl" || ext == "lua" ||
+        ext == "pl" || ext == "awk" || ext == "diff" || ext == "patch" || ext == "srt" || ext == "vtt") {
         return ASZ_CLASS_TEXT;
     }
 

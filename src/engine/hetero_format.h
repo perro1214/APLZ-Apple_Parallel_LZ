@@ -198,33 +198,6 @@ static_assert(sizeof(HxArchiveHeader) == 32, "HxArchiveHeader size mismatch");
 static_assert(sizeof(HxBlockHeader)   == 16, "HxBlockHeader size mismatch");
 static_assert(sizeof(HxLzBlockMeta)   == 16, "HxLzBlockMeta size mismatch");
 
-// ─── ARM64 ハードウェア CRC32C (1 コア ~15+ GB/s) ──────────────────────────────
-static inline uint32_t hx_crc32c(const uint8_t* data, size_t len) {
-    uint32_t crc = 0xFFFFFFFFu;
-    size_t i = 0;
-#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
-    for (; i + 8u <= len; i += 8u) {
-        uint64_t v;
-        memcpy(&v, data + i, 8u);
-        crc = __crc32cd(crc, v);
-    }
-    if (i + 4u <= len) {
-        uint32_t v;
-        memcpy(&v, data + i, 4u);
-        crc = __crc32cw(crc, v);
-        i += 4u;
-    }
-    for (; i < len; ++i) crc = __crc32cb(crc, data[i]);
-#else
-    for (; i < len; ++i) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; ++b)
-            crc = (crc >> 1u) ^ (0x82F63B78u & (0u - (crc & 1u)));
-    }
-#endif
-    return ~crc;
-}
-
 // ─── O(log len) GF(2) CRC32C (Castagnoli) 結合: CRC(A || B) = combine(CRC(A), CRC(B), |B|) ─
 // 事前計算した 41 個の 32x32 GF(2) 基底行列 (5 KB) により、1 結合あたり ~10 ns で厳密一致!
 static inline uint32_t hx_gf2_mat_vec(const uint32_t mat[32], uint32_t vec) {
@@ -267,4 +240,54 @@ static inline uint32_t hx_crc32c_combine(uint32_t crc1, uint32_t crc2, uint64_t 
         k++;
     }
     return crc1 ^ crc2;
+}
+
+// ─── ARM64 3-way 並列ハードウェア CRC32C (1 コア ~40+ GB/s) ──────────────────────
+static inline uint32_t hx_crc32c(const uint8_t* data, size_t len) {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+    uint32_t crc = 0xFFFFFFFFu;
+    size_t i = 0u;
+    if (__builtin_expect(len >= 768u, 1)) {
+        const size_t seg = (len / 3u) & ~(size_t)7u;
+        const uint8_t* p0 = data;
+        const uint8_t* p1 = data + seg;
+        const uint8_t* p2 = data + seg * 2u;
+        uint32_t c0 = 0xFFFFFFFFu;
+        uint32_t c1 = 0u;
+        uint32_t c2 = 0u;
+        for (size_t j = 0u; j < seg; j += 8u) {
+            uint64_t v0, v1, v2;
+            memcpy(&v0, p0 + j, 8u);
+            memcpy(&v1, p1 + j, 8u);
+            memcpy(&v2, p2 + j, 8u);
+            c0 = __crc32cd(c0, v0);
+            c1 = __crc32cd(c1, v1);
+            c2 = __crc32cd(c2, v2);
+        }
+        // c0 は標準 init=0xFFFFFFFF、c1/c2 は init=0 (線形結合: M_seg * c0 ^ c1 = R(0xFFFFFFFF, A||B) で厳密一致!)
+        crc = hx_crc32c_combine(hx_crc32c_combine(c0, c1, seg), c2, seg);
+        i = seg * 3u;
+    }
+    for (; i + 8u <= len; i += 8u) {
+        uint64_t v;
+        memcpy(&v, data + i, 8u);
+        crc = __crc32cd(crc, v);
+    }
+    if (i + 4u <= len) {
+        uint32_t v;
+        memcpy(&v, data + i, 4u);
+        crc = __crc32cw(crc, v);
+        i += 4u;
+    }
+    for (; i < len; ++i) crc = __crc32cb(crc, data[i]);
+    return ~crc;
+#else
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; ++b)
+            crc = (crc >> 1u) ^ (0x82F63B78u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+#endif
 }

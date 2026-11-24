@@ -28,10 +28,42 @@
 #include <unordered_set>
 #include <algorithm>
 #include <functional>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <memory>
 
 #include "aplz_format.h"
 #include "aplz_fastcdc.h"
 #include "../engine/hetero_engine.h"
+
+// 非同期パック圧縮へ mmap 領域の寿命を安全に受け渡す RAII ガード
+struct AszMappedFileGuard {
+    void*  ptr  = MAP_FAILED;
+    size_t size = 0u;
+    int    fd   = -1;
+    AszMappedFileGuard(void* p, size_t s, int f) : ptr(p), size(s), fd(f) {}
+    ~AszMappedFileGuard() {
+        if (ptr != MAP_FAILED && size > 0u) munmap(ptr, size);
+        if (fd >= 0) close(fd);
+    }
+    AszMappedFileGuard(const AszMappedFileGuard&) = delete;
+    AszMappedFileGuard& operator=(const AszMappedFileGuard&) = delete;
+};
+
+static inline bool asz_read_all_fd(int fd, uint8_t* dst, size_t len) {
+    size_t got = 0u;
+    while (got < len) {
+        ssize_t r = read(fd, dst + got, len - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (r == 0) return false;
+        got += (size_t)r;
+    }
+    return true;
+}
 
 struct AszCreateOptions {
     uint32_t level        = 3u;   // 1 (--fast) / 3 (--default) / 6 (--high)
@@ -279,20 +311,26 @@ public:
         struct ScanItem {
             std::string src_path;
             std::string rel_path;
+            std::string name;       // 親ディレクトリ内ベース名 (dir_id != UINT32_MAX 時 openat に使用)
             std::string target;
             uint64_t    raw_size    = 0u;
             uint64_t    mtime_ns    = 0u;
+            uint32_t    dir_id      = UINT32_MAX;
             uint16_t    mode        = 0644u;
             uint8_t     entry_type  = ASZ_ENTRY_FILE;
             uint8_t     solid_class = ASZ_CLASS_BINARY;
             uint32_t    entry_idx   = 0u;
         };
 
-        std::vector<ScanItem> items;
-        std::unordered_set<std::string> seen_paths;
+        dispatch_queue_t par_q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
 
-        std::function<bool(const std::string&, const std::string&)> walk =
-            [&](const std::string& src, const std::string& rel) -> bool {
+        // ── Phase 0: 並列 fstatat ディレクトリ走査 (数万ファイルでも数十 ms!) ──────
+        struct DirJob { std::string src_dir; std::string rel_prefix; };
+        std::vector<DirJob>      dir_stack;
+        std::vector<std::string> scan_dirs;
+        std::vector<ScanItem>    items;
+
+        auto make_root_item = [&](const std::string& src, const std::string& rel) -> bool {
             struct stat st;
             if (lstat(src.c_str(), &st) != 0) {
                 last_error = "Cannot stat input: " + src;
@@ -302,17 +340,11 @@ public:
                 last_error = "Unsafe relative path: " + rel;
                 return false;
             }
-            if (!seen_paths.insert(rel).second) {
-                last_error = "Duplicate archive path: " + rel;
-                return false;
-            }
-
             ScanItem it;
             it.src_path = src;
             it.rel_path = rel;
             it.mtime_ns = asz_stat_mtime_ns(st);
             it.mode     = (uint16_t)(st.st_mode & 07777u);
-
             if (S_ISLNK(st.st_mode)) {
                 char buf[4096];
                 ssize_t n = readlink(src.c_str(), buf, sizeof(buf) - 1u);
@@ -321,35 +353,16 @@ public:
                 it.entry_type = ASZ_ENTRY_SYMLINK;
                 it.target     = std::string(buf, (size_t)n);
                 items.push_back(std::move(it));
-                return true;
-            }
-            if (S_ISDIR(st.st_mode)) {
+            } else if (S_ISDIR(st.st_mode)) {
                 it.entry_type = ASZ_ENTRY_DIR;
                 items.push_back(std::move(it));
-
-                DIR* d = opendir(src.c_str());
-                if (!d) { last_error = "Cannot open dir: " + src; return false; }
-                std::vector<std::string> names;
-                while (struct dirent* de = readdir(d)) {
-                    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-                    names.emplace_back(de->d_name);
-                }
-                closedir(d);
-                std::sort(names.begin(), names.end());
-                for (const std::string& nm : names) {
-                    if (!walk(src + "/" + nm, rel + "/" + nm)) return false;
-                }
-                return true;
-            }
-            if (S_ISREG(st.st_mode)) {
-                it.entry_type = ASZ_ENTRY_FILE;
-                it.raw_size   = (uint64_t)st.st_size;
-                // 拡張子のみで高速一次判定 (未確定のみ後段で全コア並列マジック検査)
+                dir_stack.push_back({ src, rel });
+            } else if (S_ISREG(st.st_mode)) {
+                it.entry_type  = ASZ_ENTRY_FILE;
+                it.raw_size    = (uint64_t)st.st_size;
                 it.solid_class = asz_classify_file(rel, nullptr, 0u);
                 items.push_back(std::move(it));
-                return true;
             }
-            // FIFO / Socket / Device はスキップ
             return true;
         };
 
@@ -357,30 +370,176 @@ public:
             std::string clean = asz_strip_trailing_slashes(raw_in);
             std::string base  = asz_basename(clean);
             if (base.empty() || base == "." || base == "..") {
-                // カレントディレクトリ "." が指定された場合は中身を展開追加
-                DIR* d = opendir(clean.c_str());
-                if (!d) { last_error = "Cannot open dir: " + clean; return false; }
-                std::vector<std::string> names;
-                while (struct dirent* de = readdir(d)) {
-                    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-                    names.emplace_back(de->d_name);
+                struct stat st;
+                if (lstat(clean.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+                    last_error = "Cannot open dir: " + clean;
+                    return false;
                 }
-                closedir(d);
-                std::sort(names.begin(), names.end());
-                for (const std::string& nm : names) {
-                    if (!walk(clean + "/" + nm, nm)) return false;
-                }
+                dir_stack.push_back({ clean, "" });
             } else {
-                if (!walk(clean, base)) return false;
+                if (!make_root_item(clean, base)) return false;
             }
         }
 
-        // 拡張子未確定 (ASZ_CLASS_BINARY) の通常ファイルのみ先頭 256B を全コア並列でマジック判定
-        dispatch_queue_t par_q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+        if (!dir_stack.empty()) {
+            std::mutex              q_mtx;
+            std::condition_variable q_cv;
+            std::mutex              out_mtx;
+            int                     active_dirs = 0;
+            bool                    walk_failed = false;
+            std::string             walk_err;
+
+            auto* q_mtx_p    = &q_mtx;
+            auto* q_cv_p     = &q_cv;
+            auto* out_mtx_p  = &out_mtx;
+            auto* stack_p    = &dir_stack;
+            auto* sdirs_p    = &scan_dirs;
+            auto* items_p    = &items;
+            auto* active_p   = &active_dirs;
+            auto* wfail_p    = &walk_failed;
+            auto* werr_p     = &walk_err;
+
+            dispatch_apply(8u, par_q, ^(size_t /*w*/) {
+                std::vector<ScanItem> local_items;
+                std::vector<DirJob>   local_dirs;
+                while (true) {
+                    DirJob job;
+                    {
+                        std::unique_lock<std::mutex> lk(*q_mtx_p);
+                        q_cv_p->wait(lk, [&]() {
+                            return *wfail_p || !stack_p->empty() || *active_p == 0;
+                        });
+                        if (*wfail_p || (stack_p->empty() && *active_p == 0)) break;
+                        job = std::move(stack_p->back());
+                        stack_p->pop_back();
+                        (*active_p)++;
+                    }
+
+                    int dfd = open(job.src_dir.c_str(), O_RDONLY | O_DIRECTORY);
+                    if (dfd < 0) {
+                        std::lock_guard<std::mutex> lk(*q_mtx_p);
+                        if (!*wfail_p) { *wfail_p = true; *werr_p = "Cannot open dir: " + job.src_dir; }
+                        (*active_p)--;
+                        q_cv_p->notify_all();
+                        break;
+                    }
+                    DIR* d = fdopendir(dfd);
+                    if (!d) {
+                        close(dfd);
+                        std::lock_guard<std::mutex> lk(*q_mtx_p);
+                        if (!*wfail_p) { *wfail_p = true; *werr_p = "Cannot open dir: " + job.src_dir; }
+                        (*active_p)--;
+                        q_cv_p->notify_all();
+                        break;
+                    }
+
+                    uint32_t my_dir_id = UINT32_MAX;
+                    local_dirs.clear();
+                    bool local_err = false;
+                    std::string local_err_msg;
+
+                    while (struct dirent* de = readdir(d)) {
+                        const char* nm = de->d_name;
+                        if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0'))) continue;
+                        struct stat st;
+                        if (fstatat(dfd, nm, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+                            local_err = true;
+                            local_err_msg = "Cannot stat input: " + job.src_dir + "/" + nm;
+                            break;
+                        }
+                        std::string rel = job.rel_prefix.empty() ? std::string(nm) : (job.rel_prefix + "/" + nm);
+                        if (!asz_is_safe_rel_path(rel)) {
+                            local_err = true;
+                            local_err_msg = "Unsafe relative path: " + rel;
+                            break;
+                        }
+                        std::string full_src = job.src_dir + "/" + nm;
+
+                        ScanItem it;
+                        it.src_path = full_src;
+                        it.rel_path = std::move(rel);
+                        it.mtime_ns = asz_stat_mtime_ns(st);
+                        it.mode     = (uint16_t)(st.st_mode & 07777u);
+
+                        if (S_ISLNK(st.st_mode)) {
+                            char buf[4096];
+                            ssize_t n = readlinkat(dfd, nm, buf, sizeof(buf) - 1u);
+                            if (n < 0) {
+                                local_err = true;
+                                local_err_msg = "readlink failed: " + full_src;
+                                break;
+                            }
+                            buf[n] = '\0';
+                            it.entry_type = ASZ_ENTRY_SYMLINK;
+                            it.target     = std::string(buf, (size_t)n);
+                            local_items.push_back(std::move(it));
+                        } else if (S_ISDIR(st.st_mode)) {
+                            it.entry_type = ASZ_ENTRY_DIR;
+                            local_dirs.push_back({ full_src, it.rel_path });
+                            local_items.push_back(std::move(it));
+                        } else if (S_ISREG(st.st_mode)) {
+                            it.entry_type  = ASZ_ENTRY_FILE;
+                            it.raw_size    = (uint64_t)st.st_size;
+                            it.solid_class = asz_classify_file(it.rel_path, nullptr, 0u);
+                            if (it.raw_size > 0u && it.raw_size < ASZ_SMALL_FILE_THRESH) {
+                                if (my_dir_id == UINT32_MAX) {
+                                    std::lock_guard<std::mutex> olk(*out_mtx_p);
+                                    my_dir_id = (uint32_t)sdirs_p->size();
+                                    sdirs_p->push_back(job.src_dir);
+                                }
+                                it.dir_id = my_dir_id;
+                                it.name   = nm;
+                            }
+                            local_items.push_back(std::move(it));
+                        }
+                    }
+                    closedir(d);
+
+                    {
+                        std::lock_guard<std::mutex> lk(*q_mtx_p);
+                        if (local_err && !*wfail_p) {
+                            *wfail_p = true;
+                            *werr_p  = std::move(local_err_msg);
+                        }
+                        if (!*wfail_p) {
+                            for (auto& dj : local_dirs) stack_p->push_back(std::move(dj));
+                        }
+                        (*active_p)--;
+                        q_cv_p->notify_all();
+                    }
+                }
+                if (!local_items.empty()) {
+                    std::lock_guard<std::mutex> olk(*out_mtx_p);
+                    items_p->insert(items_p->end(),
+                                    std::make_move_iterator(local_items.begin()),
+                                    std::make_move_iterator(local_items.end()));
+                }
+            });
+
+            if (walk_failed) {
+                last_error = walk_err;
+                return false;
+            }
+        }
+
+        // 決定論的ソート & 重複パス検証
+        std::sort(items.begin(), items.end(), [](const ScanItem& a, const ScanItem& b) {
+            return a.rel_path < b.rel_path;
+        });
+        for (size_t i = 1u; i < items.size(); ++i) {
+            if (items[i].rel_path == items[i - 1u].rel_path) {
+                last_error = "Duplicate archive path: " + items[i].rel_path;
+                return false;
+            }
+        }
+
+        // 拡張子未確定 (ASZ_CLASS_BINARY) の大ファイル (>= 64 KiB) のみ先頭 256B を並列マジック判定
+        // (小ファイル < 64 KiB は Phase A の 1 パス読込内でメモリ上判定するため二重 open ゼロ!)
         {
             std::vector<uint32_t> need_probe;
             for (size_t i = 0u; i < items.size(); ++i) {
-                if (items[i].entry_type == ASZ_ENTRY_FILE && items[i].raw_size > 0u &&
+                if (items[i].entry_type == ASZ_ENTRY_FILE &&
+                    items[i].raw_size >= ASZ_SMALL_FILE_THRESH &&
                     items[i].solid_class == ASZ_CLASS_BINARY) {
                     need_probe.push_back((uint32_t)i);
                 }
@@ -434,13 +593,33 @@ public:
             eng.warmup_gpu_encode_async();
         }
 
-        // 出力ファイル (.tmp 経由でアトミック置換, 無バッファ直接 write で余分な stdio コピー排除)
+        // 出力ファイル (.tmp 経由でアトミック置換, 無バッファ直接 write + 大容量時は F_NOCACHE で書込 3 GB/s & 0ms close!)
         std::string tmp_path = out_asz_path + ".tmp";
         FILE* fout = fopen(tmp_path.c_str(), "wb");
         if (!fout) { last_error = "Cannot create output file: " + tmp_path; return false; }
         setvbuf(fout, nullptr, _IONBF, 0);
+        const int out_fd = fileno(fout);
+#if defined(__APPLE__) && defined(F_NOCACHE)
+        // 512 MiB 以上の大容量アーカイブ出力ではページキャッシュ汚染・fclose フラッシュ待ち(250ms+)を回避!
+        if (total_raw >= 512ull * 1024ull * 1024ull) {
+            (void)fcntl(out_fd, F_NOCACHE, 1);
+        }
+#endif
+
+        dispatch_queue_t     pack_q   = dispatch_queue_create("aplz.arch.pack", DISPATCH_QUEUE_SERIAL);
+        dispatch_semaphore_t pack_sem = dispatch_semaphore_create(3); // 最大 3 パック先行投入で I/O と圧縮を完全重畳!
+        dispatch_group_t     pack_grp = dispatch_group_create();
+
+        struct PackWriterState {
+            uint64_t          file_cursor  = sizeof(AszFileHeader);
+            uint64_t          prealloc_end = 0u;
+            std::atomic<bool> failed{false};
+        };
+        PackWriterState  pw;
+        PackWriterState* pw_p = &pw;
 
         auto abort_out = [&]() -> bool {
+            dispatch_group_wait(pack_grp, DISPATCH_TIME_FOREVER);
             fclose(fout);
             unlink(tmp_path.c_str());
             return false;
@@ -448,13 +627,16 @@ public:
 
         AszFileHeader fhdr = {};
         if (fwrite(&fhdr, sizeof(fhdr), 1, fout) != 1) { last_error = "Header write failed"; return abort_out(); }
-        uint64_t file_cursor = sizeof(fhdr);
 
         std::vector<AszPackDesc>   packs;
         std::vector<AszChunkDesc>  chunks;
         std::vector<AszEntryDesc>  entries(items.size());
         std::vector<AszExtentDesc> extents;
         std::string                str_pool;
+
+        // --no-dedup 大スライス向け遅延 CRC 反映テーブル (pack_q 専用)
+        struct DeferredCrc { uint32_t chunk_id; uint32_t entry_idx; uint32_t slice_len; uint32_t crc; };
+        std::vector<DeferredCrc> deferred_crcs;
 
         // Entry 基本メタデータ設定
         for (size_t i = 0u; i < items.size(); ++i) {
@@ -481,127 +663,292 @@ public:
         std::unordered_map<AszChunkKey, uint32_t, AszChunkKeyHash> chunk_map;
         chunk_map.reserve(std::min((size_t)262144u, (size_t)(total_raw / 49152u) + 1024u));
 
-        // ステージング Pack バッファ & ゼロ中間バッファ直接ストリーミング圧縮フラッシュ
-        std::vector<uint8_t> pack_buf;
+        // 非同期パック用再利用バッファプール (32/128 MiB 毎回の vm_allocate/vm_deallocate ページフォルトを完全撤廃!)
+        struct PackBufPool {
+            std::mutex mtx;
+            std::vector<std::shared_ptr<HxRawBuf>> free_small; // 4 MiB Solid 用
+            std::vector<std::shared_ptr<HxRawBuf>> free_large; // 128 MiB Large 用
 
-        auto write_compressed_pack = [&](const uint8_t* raw_ptr, uint32_t raw_len,
-                                         uint8_t sclass, bool is_solid,
-                                         uint32_t* out_raw_crc = nullptr) -> bool {
+            std::shared_ptr<HxRawBuf> acquire(size_t need, bool is_solid) {
+                std::shared_ptr<HxRawBuf> b;
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    auto& vec = is_solid ? free_small : free_large;
+                    if (!vec.empty()) {
+                        b = std::move(vec.back());
+                        vec.pop_back();
+                    }
+                }
+                if (!b) b = std::make_shared<HxRawBuf>();
+                b->ensure(need);
+                return b;
+            }
+            void release(std::shared_ptr<HxRawBuf> b, bool is_solid) {
+                if (!b) return;
+                std::lock_guard<std::mutex> lk(mtx);
+                auto& vec = is_solid ? free_small : free_large;
+                if (vec.size() < 4u) vec.push_back(std::move(b));
+            }
+        };
+        auto buf_pool = std::make_shared<PackBufPool>();
+
+        uint32_t next_pack_id = 0u;
+        HeteroEngine*            eng_p     = &eng;
+        std::vector<AszPackDesc>* packs_p  = &packs;
+        std::vector<DeferredCrc>* def_p    = &deferred_crcs;
+        const uint32_t           enc_level = opts.level;
+
+        // 非同期パック投入: 所有 HxRawBuf 版 (Read+FastCDC と Compress+Write を完全重畳 + 完了後プール返却!)
+        auto submit_pack_owned = [&](std::shared_ptr<HxRawBuf> buf, uint32_t raw_len,
+                                     uint8_t sclass, bool is_solid, bool return_to_pool = true) -> bool {
             if (raw_len == 0u) {
-                if (out_raw_crc) *out_raw_crc = 0u;
+                if (return_to_pool) buf_pool->release(std::move(buf), is_solid);
                 return true;
             }
-            uint64_t comp_bytes = 0u;
-            uint32_t pcrc = 0u;
-            if (!eng.compress_core(raw_ptr, raw_len, opts.level, nullptr, fout, nullptr,
-                                   &comp_bytes, &pcrc, out_raw_crc)) {
+            if (pw_p->failed.load(std::memory_order_acquire)) { last_error = "Phase 2 HeteroEngine streaming compress failed"; return false; }
+            dispatch_semaphore_wait(pack_sem, DISPATCH_TIME_FOREVER);
+            if (pw_p->failed.load(std::memory_order_acquire)) {
+                dispatch_semaphore_signal(pack_sem);
                 last_error = "Phase 2 HeteroEngine streaming compress failed";
                 return false;
             }
-            AszPackDesc pd = {};
-            pd.file_offset = file_cursor;
-            pd.comp_size   = comp_bytes;
-            pd.raw_size    = raw_len;
-            pd.pack_crc32c = pcrc;
-            pd.solid_class = sclass;
-            pd.is_solid    = is_solid ? 1u : 0u;
-            packs.push_back(pd);
-            file_cursor += comp_bytes;
+            next_pack_id++;
+            dispatch_group_enter(pack_grp);
+            dispatch_async(pack_q, ^{
+                if (!pw_p->failed.load(std::memory_order_relaxed)) {
+                    hx_preallocate_ahead_fd(out_fd, pw_p->prealloc_end, pw_p->file_cursor + (uint64_t)raw_len + 65536ull);
+                    uint64_t comp_bytes = 0u;
+                    uint32_t pcrc = 0u;
+                    if (!eng_p->compress_core(buf->data(), raw_len, enc_level, nullptr, fout, nullptr,
+                                              &comp_bytes, &pcrc, nullptr)) {
+                        pw_p->failed.store(true, std::memory_order_release);
+                    } else {
+                        AszPackDesc pd = {};
+                        pd.file_offset = pw_p->file_cursor;
+                        pd.comp_size   = comp_bytes;
+                        pd.raw_size    = raw_len;
+                        pd.pack_crc32c = pcrc;
+                        pd.solid_class = sclass;
+                        pd.is_solid    = is_solid ? 1u : 0u;
+                        packs_p->push_back(pd);
+                        pw_p->file_cursor += comp_bytes;
+                    }
+                }
+                if (return_to_pool) buf_pool->release(buf, is_solid);
+                dispatch_semaphore_signal(pack_sem);
+                dispatch_group_leave(pack_grp);
+            });
             return true;
         };
 
-        // ── Phase A: 小ファイル (< 64 KiB) 全コア並列読込 + 型別 Solid Grouping ───
-        std::vector<uint32_t> small_by_class[ASZ_NUM_CLASSES];
-        std::vector<uint32_t> large_by_class[ASZ_NUM_CLASSES];
+        // 非同期パック投入: ゼロコピー mmap スパン版 (AszMappedFileGuard で寿命保証!)
+        auto submit_pack_mapped = [&](std::shared_ptr<AszMappedFileGuard> mg, const uint8_t* raw_ptr,
+                                      uint32_t raw_len, uint8_t sclass,
+                                      uint32_t defer_cid = UINT32_MAX, uint32_t defer_eidx = UINT32_MAX) -> bool {
+            if (raw_len == 0u) return true;
+            if (pw_p->failed.load(std::memory_order_acquire)) { last_error = "Phase 2 HeteroEngine streaming compress failed"; return false; }
+            dispatch_semaphore_wait(pack_sem, DISPATCH_TIME_FOREVER);
+            if (pw_p->failed.load(std::memory_order_acquire)) {
+                dispatch_semaphore_signal(pack_sem);
+                last_error = "Phase 2 HeteroEngine streaming compress failed";
+                return false;
+            }
+            next_pack_id++;
+            dispatch_group_enter(pack_grp);
+            dispatch_async(pack_q, ^{
+                (void)mg; // 非同期圧縮完了まで mmap + fd を保持!
+                if (!pw_p->failed.load(std::memory_order_relaxed)) {
+                    hx_preallocate_ahead_fd(out_fd, pw_p->prealloc_end, pw_p->file_cursor + (uint64_t)raw_len + 65536ull);
+                    uint64_t comp_bytes = 0u;
+                    uint32_t pcrc = 0u;
+                    uint32_t slice_crc = 0u;
+                    uint32_t* raw_crc_ptr = (defer_cid != UINT32_MAX) ? &slice_crc : nullptr;
+                    if (!eng_p->compress_core(raw_ptr, raw_len, enc_level, nullptr, fout, nullptr,
+                                              &comp_bytes, &pcrc, raw_crc_ptr)) {
+                        pw_p->failed.store(true, std::memory_order_release);
+                    } else {
+                        AszPackDesc pd = {};
+                        pd.file_offset = pw_p->file_cursor;
+                        pd.comp_size   = comp_bytes;
+                        pd.raw_size    = raw_len;
+                        pd.pack_crc32c = pcrc;
+                        pd.solid_class = sclass;
+                        pd.is_solid    = 0u;
+                        packs_p->push_back(pd);
+                        pw_p->file_cursor += comp_bytes;
+                        if (defer_cid != UINT32_MAX) {
+                            def_p->push_back({ defer_cid, defer_eidx, raw_len, slice_crc });
+                        }
+                    }
+                }
+                dispatch_semaphore_signal(pack_sem);
+                dispatch_group_leave(pack_grp);
+            });
+            return true;
+        };
+
+        // ── Phase A: 小ファイル (< 64 KiB) 1 パス openat 並列読込 + 型別 Solid Grouping ─
+        // ディレクトリ単位に 4 ワーカーで openat(dirfd) 読込＋指紋＋型確定を 1 パスで完了!
+        std::vector<std::vector<uint32_t>> small_by_dir(scan_dirs.size());
+        std::vector<uint32_t>              small_root;
+        std::vector<uint32_t>              large_by_class[ASZ_NUM_CLASSES];
+
         for (size_t i = 0u; i < items.size(); ++i) {
             if (items[i].entry_type != ASZ_ENTRY_FILE || items[i].raw_size == 0u) continue;
-            uint8_t cls = opts.enable_solid ? items[i].solid_class : ASZ_CLASS_BINARY;
             if (items[i].raw_size < ASZ_SMALL_FILE_THRESH) {
-                small_by_class[cls].push_back((uint32_t)i);
+                if (items[i].dir_id != UINT32_MAX) small_by_dir[items[i].dir_id].push_back((uint32_t)i);
+                else                               small_root.push_back((uint32_t)i);
             } else {
+                uint8_t cls = opts.enable_solid ? items[i].solid_class : ASZ_CLASS_BINARY;
                 large_by_class[cls].push_back((uint32_t)i);
             }
         }
 
-        std::vector<uint8_t> small_batch_buf;
-        for (uint8_t cls = 0u; cls < ASZ_NUM_CLASSES; ++cls) {
-            auto& idxs = small_by_class[cls];
-            if (idxs.empty()) continue;
+        // 小ファイルをディレクトリ単位で <= 256 MiB のウェーブに分割 (16,328 ファイルでも 1 ウェーブ!)
+        struct SmallDirGroup { uint32_t dir_id; std::vector<uint32_t> idxs; size_t bytes; };
+        std::vector<SmallDirGroup> small_groups;
+        small_groups.reserve(scan_dirs.size() + 1u);
+        for (uint32_t d = 0u; d < (uint32_t)small_by_dir.size(); ++d) {
+            if (small_by_dir[d].empty()) continue;
+            size_t b = 0u;
+            for (uint32_t idx : small_by_dir[d]) b += (size_t)items[idx].raw_size;
+            small_groups.push_back({ d, std::move(small_by_dir[d]), b });
+        }
+        if (!small_root.empty()) {
+            size_t b = 0u;
+            for (uint32_t idx : small_root) b += (size_t)items[idx].raw_size;
+            small_groups.push_back({ UINT32_MAX, std::move(small_root), b });
+        }
 
-            // 拡張子→ファイル名順ソートで類似小ファイルを同一 256 KiB LZ 窓へ集約!
-            std::sort(idxs.begin(), idxs.end(), [&](uint32_t a, uint32_t b) {
-                std::string ea = asz_lower_ext(items[a].rel_path);
-                std::string eb = asz_lower_ext(items[b].rel_path);
-                if (ea != eb) return ea < eb;
-                return items[a].rel_path < items[b].rel_path;
+        static const size_t SMALL_WAVE_MAX = 256ull * 1024ull * 1024ull;
+        HxRawBuf small_wave_buf;
+        size_t sg_pos = 0u;
+        while (sg_pos < small_groups.size()) {
+            size_t sg_end = sg_pos;
+            size_t wave_bytes = 0u;
+            size_t wave_files = 0u;
+            while (sg_end < small_groups.size()) {
+                if (sg_end > sg_pos && wave_bytes + small_groups[sg_end].bytes > SMALL_WAVE_MAX) break;
+                wave_bytes += small_groups[sg_end].bytes;
+                wave_files += small_groups[sg_end].idxs.size();
+                sg_end++;
+            }
+
+            small_wave_buf.ensure(wave_bytes);
+            std::vector<uint32_t>    w_item_idx(wave_files);
+            std::vector<size_t>      w_buf_off(wave_files);
+            std::vector<AszChunkKey> w_keys(wave_files);
+            std::vector<size_t>      grp_first(sg_end - sg_pos);
+            std::vector<size_t>      grp_count(sg_end - sg_pos);
+
+            size_t fcur = 0u, bcur = 0u;
+            for (size_t g = sg_pos; g < sg_end; ++g) {
+                grp_first[g - sg_pos] = fcur;
+                grp_count[g - sg_pos] = small_groups[g].idxs.size();
+                for (uint32_t idx : small_groups[g].idxs) {
+                    w_item_idx[fcur] = idx;
+                    w_buf_off[fcur]  = bcur;
+                    bcur += (size_t)items[idx].raw_size;
+                    fcur++;
+                }
+            }
+
+            ScanItem*              items_p   = items.data();
+            const std::string*     sdirs_p   = scan_dirs.data();
+            const SmallDirGroup*   sgrps_p   = small_groups.data() + sg_pos;
+            const size_t*          gfirst_p  = grp_first.data();
+            const size_t*          gcnt_p    = grp_count.data();
+            const uint32_t*        widx_p    = w_item_idx.data();
+            const size_t*          woff_p    = w_buf_off.data();
+            uint8_t*               wbuf_p    = small_wave_buf.data();
+            AszChunkKey*           wkeys_p   = w_keys.data();
+            const size_t           n_grps    = sg_end - sg_pos;
+            const bool             do_dedup  = opts.enable_dedup;
+            std::atomic<size_t>    next_g{0u};
+            std::atomic<int>       read_err{-1};
+            std::atomic<size_t>*   next_g_p  = &next_g;
+            std::atomic<int>*      rerr_p    = &read_err;
+
+            // APFS 最適化: 1 ディレクトリ 1 open(O_DIRECTORY) + openat(dfd, name)、コールド NVMe IOPS 飽和のため最大 10 ワーカー!
+            const size_t n_workers = std::min((size_t)10u, n_grps);
+            dispatch_apply(n_workers, par_q, ^(size_t /*w*/) {
+                while (true) {
+                    if (rerr_p->load(std::memory_order_relaxed) >= 0) return;
+                    size_t g = next_g_p->fetch_add(1u, std::memory_order_relaxed);
+                    if (g >= n_grps) break;
+                    uint32_t did = sgrps_p[g].dir_id;
+                    int dfd = (did != UINT32_MAX) ? open(sdirs_p[did].c_str(), O_RDONLY | O_DIRECTORY) : -1;
+                    size_t f0 = gfirst_p[g];
+                    size_t fc = gcnt_p[g];
+                    for (size_t k = 0u; k < fc; ++k) {
+                        uint32_t idx = widx_p[f0 + k];
+                        ScanItem& it = items_p[idx];
+                        uint32_t flen = (uint32_t)it.raw_size;
+                        uint8_t* dst  = wbuf_p + woff_p[f0 + k];
+                        int fd = (dfd >= 0) ? openat(dfd, it.name.c_str(), O_RDONLY)
+                                            : open(it.src_path.c_str(), O_RDONLY);
+                        if (fd < 0) {
+                            int exp = -1; rerr_p->compare_exchange_strong(exp, (int)idx);
+                            if (dfd >= 0) close(dfd);
+                            return;
+                        }
+                        bool rok = asz_read_all_fd(fd, dst, flen);
+                        close(fd);
+                        if (!rok) {
+                            int exp = -1; rerr_p->compare_exchange_strong(exp, (int)idx);
+                            if (dfd >= 0) close(dfd);
+                            return;
+                        }
+                        // 未確定拡張子はメモリ上から即時マジック判定 (二重 open ゼロ!)
+                        if (it.solid_class == ASZ_CLASS_BINARY) {
+                            it.solid_class = asz_classify_file(it.rel_path, dst, flen);
+                        }
+                        wkeys_p[f0 + k] = do_dedup
+                                              ? asz_fingerprint_chunk(dst, flen)
+                                              : AszChunkKey{ 0ULL, 0ULL, flen, hx_crc32c(dst, flen) };
+                    }
+                    if (dfd >= 0) close(dfd);
+                }
             });
 
-            pack_buf.clear();
-            const size_t SMALL_BATCH = 256u;
-            for (size_t b0 = 0u; b0 < idxs.size(); b0 += SMALL_BATCH) {
-                const size_t bc = std::min(SMALL_BATCH, idxs.size() - b0);
-                std::vector<size_t>      boffs(bc);
-                std::vector<AszChunkKey> bkeys(bc);
-                size_t total_batch_bytes = 0u;
-                for (size_t k = 0u; k < bc; ++k) {
-                    boffs[k] = total_batch_bytes;
-                    total_batch_bytes += (size_t)items[idxs[b0 + k]].raw_size;
-                }
-                small_batch_buf.resize(total_batch_bytes);
+            int eidx = read_err.load();
+            if (eidx >= 0) {
+                last_error = "Cannot read file: " + items[(size_t)eidx].src_path;
+                return abort_out();
+            }
 
-                const ScanItem* items_p = items.data();
-                const uint32_t* idxs_p  = idxs.data() + b0;
-                const size_t*   offs_p  = boffs.data();
-                uint8_t*        buf_p   = small_batch_buf.data();
-                AszChunkKey*    keys_p  = bkeys.data();
-                const bool      do_dedup = opts.enable_dedup;
-                std::atomic<int> read_err{-1};
-                std::atomic<int>* read_err_p = &read_err;
+            // 型別バケット化 & 拡張子順ソート (メモリ上なので数 ms!)
+            std::vector<uint32_t> wave_cls[ASZ_NUM_CLASSES];
+            for (size_t k = 0u; k < wave_files; ++k) {
+                uint32_t idx = w_item_idx[k];
+                entries[idx].solid_class = items[idx].solid_class;
+                uint8_t cls = opts.enable_solid ? items[idx].solid_class : ASZ_CLASS_BINARY;
+                wave_cls[cls].push_back((uint32_t)k);
+            }
 
-                dispatch_apply(bc, par_q, ^(size_t k) {
-                    uint32_t idx = idxs_p[k];
-                    const ScanItem& it = items_p[idx];
-                    uint32_t flen = (uint32_t)it.raw_size;
-                    uint8_t* dst = buf_p + offs_p[k];
-                    int fd = open(it.src_path.c_str(), O_RDONLY);
-                    if (fd < 0) {
-                        int exp = -1;
-                        read_err_p->compare_exchange_strong(exp, (int)idx);
-                        return;
-                    }
-                    size_t got_tot = 0u;
-                    while (got_tot < flen) {
-                        ssize_t r = read(fd, dst + got_tot, flen - got_tot);
-                        if (r < 0) {
-                            if (errno == EINTR) continue;
-                            break;
-                        }
-                        if (r == 0) break;
-                        got_tot += (size_t)r;
-                    }
-                    close(fd);
-                    if (got_tot != flen) {
-                        int exp = -1;
-                        read_err_p->compare_exchange_strong(exp, (int)idx);
-                        return;
-                    }
-                    keys_p[k] = do_dedup
-                                    ? asz_fingerprint_chunk(dst, flen)
-                                    : AszChunkKey{ 0ULL, 0ULL, flen, hx_crc32c(dst, flen) };
+            for (uint8_t cls = 0u; cls < ASZ_NUM_CLASSES; ++cls) {
+                auto& ks = wave_cls[cls];
+                if (ks.empty()) continue;
+
+                // 拡張子を事前抽出 (ソート比較毎の std::string ヒープ確保を完全撤廃!)
+                struct SortKey { uint32_t k; std::string ext; };
+                std::vector<SortKey> skeys;
+                skeys.reserve(ks.size());
+                for (uint32_t k : ks) skeys.push_back({ k, asz_lower_ext(items[w_item_idx[k]].rel_path) });
+                std::sort(skeys.begin(), skeys.end(), [&](const SortKey& a, const SortKey& b) {
+                    if (a.ext != b.ext) return a.ext < b.ext;
+                    return items[w_item_idx[a.k]].rel_path < items[w_item_idx[b.k]].rel_path;
                 });
 
-                int eidx = read_err.load();
-                if (eidx >= 0) {
-                    last_error = "Cannot read file: " + items[(size_t)eidx].src_path;
-                    return abort_out();
-                }
+                auto spack = buf_pool->acquire(ASZ_SOLID_PACK_MAX + 64u, true);
+                uint32_t spack_used = 0u;
 
-                // 決定論的順序で chunk_map / pack_buf へ確定反映
-                for (size_t k = 0u; k < bc; ++k) {
-                    uint32_t idx = idxs[b0 + k];
+                for (const SortKey& sk : skeys) {
+                    uint32_t k = sk.k;
+                    uint32_t idx = w_item_idx[k];
                     uint32_t flen = (uint32_t)items[idx].raw_size;
-                    const uint8_t* fptr = small_batch_buf.data() + boffs[k];
-                    const AszChunkKey& key = bkeys[k];
+                    const uint8_t* fptr = small_wave_buf.data() + w_buf_off[k];
+                    const AszChunkKey& key = w_keys[k];
 
                     entries[idx].file_crc32c  = key.crc32c;
                     entries[idx].first_extent = (uint32_t)extents.size();
@@ -618,19 +965,20 @@ public:
                         }
                     }
                     if (!hit) {
-                        if (!pack_buf.empty() && pack_buf.size() + flen + 4u > ASZ_SOLID_PACK_MAX) {
-                            if (!write_compressed_pack(pack_buf.data(), (uint32_t)pack_buf.size(), cls, true))
-                                return abort_out();
-                            pack_buf.clear();
+                        if (spack_used > 0u && spack_used + flen + 4u > ASZ_SOLID_PACK_MAX) {
+                            if (!submit_pack_owned(spack, spack_used, cls, true)) return abort_out();
+                            spack = buf_pool->acquire(ASZ_SOLID_PACK_MAX + 64u, true);
+                            spack_used = 0u;
                         }
                         if (cls == ASZ_CLASS_CODE || cls == ASZ_CLASS_NUMERIC) {
-                            while ((pack_buf.size() & 3u) != 0u) pack_buf.push_back(0u);
+                            while ((spack_used & 3u) != 0u) spack->data()[spack_used++] = 0u;
                         }
                         uint32_t cid = (uint32_t)chunks.size();
-                        uint32_t off = (uint32_t)pack_buf.size();
-                        pack_buf.insert(pack_buf.end(), fptr, fptr + flen);
+                        uint32_t off = spack_used;
+                        memcpy(spack->data() + spack_used, fptr, flen);
+                        spack_used += flen;
 
-                        AszChunkDesc cd = { (uint32_t)packs.size(), off, flen, key.crc32c, key.hash_lo, key.hash_hi };
+                        AszChunkDesc cd = { next_pack_id, off, flen, key.crc32c, key.hash_lo, key.hash_hi };
                         chunks.push_back(cd);
                         if (opts.enable_dedup) chunk_map.emplace(key, cid);
                         extents.push_back({ cid, 0u, flen, 0u });
@@ -638,206 +986,543 @@ public:
                         stats.num_chunks_unique++;
                     }
                 }
+                if (spack_used > 0u) {
+                    if (!submit_pack_owned(spack, spack_used, cls, true)) return abort_out();
+                } else {
+                    buf_pool->release(std::move(spack), true);
+                }
             }
-            if (!pack_buf.empty()) {
-                if (!write_compressed_pack(pack_buf.data(), (uint32_t)pack_buf.size(), cls, true))
-                    return abort_out();
-                pack_buf.clear();
-            }
+            sg_pos = sg_end;
         }
+        // 小ファイルウェーブバッファを解放してメモリ節約
+        small_wave_buf = HxRawBuf();
 
-        // ── Phase B: 大ファイル (>= 64 KiB) 並列 FastCDC / 非重複直結ストリーミング ─
+        // ── Phase B: 大ファイル (>= 64 KiB) 並列バッチ読込/FastCDC + 非同期パック圧縮 ─
+        // ・中ファイル (64 KiB .. 16 MiB) と巨大ファイル (>= 16 MiB) を分離しバッチ断片化を完全排除!
+        // ・再利用バッファプール + med_read_buf により vm_allocate ゼロ初期化フォルトを根絶!
+        // ・巨大ファイル群 (16..128 MiB) は複数ファイルの 8 MiB スライスを 1 回の dispatch_apply へ統合!
+        static const uint64_t MED_FILE_LIMIT  = 16ull * 1024ull * 1024ull;
+        static const size_t   MED_BATCH_BYTES = 32ull * 1024ull * 1024ull;
+        static const size_t   MED_BATCH_FILES = 256u;
+        static const uint32_t MED_PACK_FLUSH  = 64u * 1024u * 1024u; // 64 MiB で即非同期投入し早期オーバーラップ!
+
+        HxRawBuf med_read_buf; // dedup ON 時に全バッチで使い回し (vm_allocate 1 回のみ!)
         std::vector<AszRawChunkSlice> raw_chunks;
+
         for (uint8_t cls = 0u; cls < ASZ_NUM_CLASSES; ++cls) {
             auto& idxs = large_by_class[cls];
             if (idxs.empty()) continue;
 
-            pack_buf.clear();
+            // 中ファイルと巨大ファイルを明示分離 (交互出現による並列バッチ分断を防止!)
+            std::vector<uint32_t> med_idxs;
+            std::vector<uint32_t> huge_idxs;
+            med_idxs.reserve(idxs.size());
             for (uint32_t idx : idxs) {
-                const ScanItem& it = items[idx];
-                int fd = open(it.src_path.c_str(), O_RDONLY);
-                if (fd < 0) { last_error = "Cannot open file: " + it.src_path; return abort_out(); }
-                void* m = mmap(nullptr, (size_t)it.raw_size, PROT_READ, MAP_PRIVATE, fd, 0);
-                if (m == MAP_FAILED) { close(fd); last_error = "mmap failed: " + it.src_path; return abort_out(); }
-                madvise(m, (size_t)it.raw_size, MADV_SEQUENTIAL);
-                const uint8_t* fdata = (const uint8_t*)m;
+                if (items[idx].raw_size < MED_FILE_LIMIT) med_idxs.push_back(idx);
+                else                                      huge_idxs.push_back(idx);
+            }
 
-                entries[idx].first_extent = (uint32_t)extents.size();
+            std::shared_ptr<HxRawBuf> pbuf;
+            uint32_t pbuf_used = 0u;
+            const size_t PBUF_CAP = (size_t)ASZ_LARGE_PACK_MAX + ASZ_CDC_MAX_SIZE + 16u;
+            auto ensure_pbuf = [&]() {
+                if (!pbuf) {
+                    pbuf = buf_pool->acquire(PBUF_CAP, false);
+                    pbuf_used = 0u;
+                }
+            };
+            auto flush_pbuf = [&]() -> bool {
+                if (pbuf_used == 0u) return true;
+                bool ok = submit_pack_owned(std::move(pbuf), pbuf_used, cls, false, true);
+                pbuf.reset();
+                pbuf_used = 0u;
+                return ok;
+            };
 
-                // 高速パス: 重複排除 OFF 時は FastCDC・事前 CRC 走査を完全スキップし 256 MiB パック直結圧縮!
-                // (compress_core の並列ブロック CRC を GF(2) 結合して file_crc32c を追加コスト 0 で取得!)
-                if (!opts.enable_dedup) {
-                    if (!pack_buf.empty()) {
-                        if (!write_compressed_pack(pack_buf.data(), (uint32_t)pack_buf.size(), cls, false)) {
-                            munmap(m, (size_t)it.raw_size); close(fd); return abort_out();
-                        }
-                        pack_buf.clear();
-                    }
-                    uint32_t file_crc = 0u;
-                    size_t foff = 0u;
-                    const size_t fsize = (size_t)it.raw_size;
-                    while (foff < fsize) {
-                        uint32_t slen = (uint32_t)std::min((size_t)ASZ_STREAM_PACK_MAX, fsize - foff);
-                        uint32_t slice_crc = 0u;
-                        uint32_t pid = (uint32_t)packs.size();
-                        if (!write_compressed_pack(fdata + foff, slen, cls, false, &slice_crc)) {
-                            munmap(m, fsize); close(fd); return abort_out();
-                        }
-                        uint32_t cid = (uint32_t)chunks.size();
-                        AszChunkDesc cd = { pid, 0u, slen, slice_crc, 0ULL, 0ULL };
-                        chunks.push_back(cd);
-                        extents.push_back({ cid, 0u, slen, 0u });
-                        file_crc = hx_crc32c_combine(file_crc, slice_crc, slen);
-                        stats.num_chunks_total++;
-                        stats.num_chunks_unique++;
-                        stats.unique_raw_bytes += slen;
-
-                        // 2 GiB 超の超巨大ファイルのみ完了ページを解放して RSS 膨張を防止
-                        if (fsize >= 2048ull * 1024ull * 1024ull) {
-                            asz_madvise_dontneed(fdata, foff, foff + slen);
-                        }
-                        foff += slen;
-                    }
-                    entries[idx].file_crc32c = file_crc;
-                    entries[idx].num_extents = (uint32_t)extents.size() - entries[idx].first_extent;
-                    munmap(m, fsize);
-                    close(fd);
-                    continue;
+            // ── (B1) 中ファイル群 (64 KiB .. 16 MiB): 32 MiB 並列バッチ read() + 並列 FastCDC ──
+            size_t mi = 0u;
+            while (mi < med_idxs.size()) {
+                size_t mj = mi;
+                size_t batch_bytes = 0u;
+                while (mj < med_idxs.size()) {
+                    uint64_t fsz = items[med_idxs[mj]].raw_size;
+                    size_t aligned_sz = (size_t)((fsz + 3ull) & ~3ull);
+                    if (mj > mi && (batch_bytes + aligned_sz > MED_BATCH_BYTES || (mj - mi) >= MED_BATCH_FILES))
+                        break;
+                    batch_bytes += aligned_sz;
+                    mj++;
+                }
+                const size_t bc = mj - mi;
+                std::vector<size_t> foffs(bc);
+                size_t cur_o = 0u;
+                for (size_t k = 0u; k < bc; ++k) {
+                    foffs[k] = cur_o;
+                    cur_o += (size_t)((items[med_idxs[mi + k]].raw_size + 3ull) & ~3ull);
                 }
 
-                // 重複排除 ON: 128 MiB ウィンドウ単位で FastCDC + 圧縮を交互実行しキャッシュ局所性 & 低 RSS を両立!
-                const size_t fsize = (size_t)it.raw_size;
-                const size_t WIN_BYTES = (size_t)ASZ_LARGE_PACK_MAX; // 128 MiB (8 MiB スーパースライスの整数倍)
-                uint32_t file_crc = 0u;
+                std::shared_ptr<HxRawBuf> owned_batch;
+                uint8_t* bbuf_p = nullptr;
+                if (opts.enable_dedup) {
+                    med_read_buf.ensure(cur_o);
+                    bbuf_p = med_read_buf.data();
+                } else {
+                    owned_batch = buf_pool->acquire(cur_o, false);
+                    bbuf_p = owned_batch->data();
+                }
 
-                const uint8_t* span_ptr = nullptr;
-                uint32_t       span_len = 0u;
+                std::vector<std::vector<AszRawChunkSlice>> batch_chunks(bc);
+                std::vector<uint32_t> batch_crcs(bc, 0u);
 
-                auto flush_span_direct = [&]() -> bool {
-                    if (span_len == 0u) return true;
-                    bool ok = write_compressed_pack(span_ptr, span_len, cls, false);
-                    span_ptr = nullptr;
-                    span_len = 0u;
-                    return ok;
-                };
-                auto materialize_span = [&]() {
-                    if (span_len == 0u) return;
-                    pack_buf.insert(pack_buf.end(), span_ptr, span_ptr + span_len);
-                    span_ptr = nullptr;
-                    span_len = 0u;
-                };
+                const ScanItem* items_p = items.data();
+                const uint32_t* idxs_p  = med_idxs.data() + mi;
+                const size_t*   foffs_p = foffs.data();
+                auto*           bch_p   = batch_chunks.data();
+                uint32_t*       bcrc_p  = batch_crcs.data();
+                const bool      do_dd   = opts.enable_dedup;
+                std::atomic<size_t> next_k{0u};
+                std::atomic<int>    rerr{-1};
+                std::atomic<size_t>* next_k_p = &next_k;
+                std::atomic<int>*    rerr_p   = &rerr;
 
-                for (size_t win_off = 0u; win_off < fsize; win_off += WIN_BYTES) {
-                    size_t win_len = std::min(WIN_BYTES, fsize - win_off);
+                const size_t nw = std::min((size_t)8u, bc);
+                dispatch_apply(nw, par_q, ^(size_t /*w*/) {
+                    while (true) {
+                        if (rerr_p->load(std::memory_order_relaxed) >= 0) return;
+                        size_t k = next_k_p->fetch_add(1u, std::memory_order_relaxed);
+                        if (k >= bc) break;
+                        uint32_t idx = idxs_p[k];
+                        const ScanItem& it = items_p[idx];
+                        uint32_t flen = (uint32_t)it.raw_size;
+                        uint8_t* dst  = bbuf_p + foffs_p[k];
+                        int fd = open(it.src_path.c_str(), O_RDONLY);
+                        if (fd < 0) {
+                            int exp = -1; rerr_p->compare_exchange_strong(exp, (int)idx);
+                            return;
+                        }
+                        bool rok = asz_read_all_fd(fd, dst, flen);
+                        close(fd);
+                        if (!rok) {
+                            int exp = -1; rerr_p->compare_exchange_strong(exp, (int)idx);
+                            return;
+                        }
+                        uint32_t pad = (uint32_t)(((flen + 3u) & ~3u) - flen);
+                        for (uint32_t p = 0u; p < pad; ++p) dst[flen + p] = 0u;
 
-                    // ウィンドウ内を全コア並列 FastCDC + 160-bit 指紋計算
-                    asz_fastcdc_chunk_and_hash(fdata + win_off, win_len, true, raw_chunks);
+                        if (do_dd) {
+                            auto& local = bch_p[k];
+                            local.reserve(flen / 48000u + 2u);
+                            size_t pos = 0u;
+                            while (pos < flen) {
+                                uint32_t cut = asz_fastcdc_next_cut(dst + pos, flen - pos);
+                                AszChunkKey key = asz_fingerprint_chunk(dst + pos, cut);
+                                local.push_back({ pos, cut, key });
+                                pos += cut;
+                            }
+                        } else {
+                            bcrc_p[k] = hx_crc32c(dst, flen);
+                        }
+                    }
+                });
 
-                    for (const AszRawChunkSlice& rc_rel : raw_chunks) {
-                        const size_t abs_off = win_off + rc_rel.offset;
-                        file_crc = hx_crc32c_combine(file_crc, rc_rel.key.crc32c, rc_rel.length);
+                int eidx = rerr.load();
+                if (eidx >= 0) {
+                    if (owned_batch) buf_pool->release(std::move(owned_batch), false);
+                    last_error = "Cannot read file: " + items[(size_t)eidx].src_path;
+                    return abort_out();
+                }
+
+                if (!opts.enable_dedup) {
+                    if (!flush_pbuf()) return abort_out();
+                    uint32_t pid = next_pack_id;
+                    for (size_t k = 0u; k < bc; ++k) {
+                        uint32_t idx  = med_idxs[mi + k];
+                        uint32_t flen = (uint32_t)items[idx].raw_size;
+                        uint32_t cid  = (uint32_t)chunks.size();
+                        chunks.push_back({ pid, (uint32_t)foffs[k], flen, batch_crcs[k], 0ULL, 0ULL });
+                        entries[idx].first_extent = (uint32_t)extents.size();
+                        entries[idx].num_extents  = 1u;
+                        entries[idx].file_crc32c  = batch_crcs[k];
+                        extents.push_back({ cid, 0u, flen, 0u });
                         stats.num_chunks_total++;
-
-                        auto mit = chunk_map.find(rc_rel.key);
-                        if (mit != chunk_map.end()) {
-                            extents.push_back({ mit->second, 0u, rc_rel.length, 0u });
-                            stats.dedup_saved_bytes += rc_rel.length;
-                            if (span_len >= 8u * 1024u * 1024u) {
-                                if (!flush_span_direct()) { munmap(m, fsize); close(fd); return abort_out(); }
-                            } else if (span_len > 0u) {
-                                materialize_span();
-                            }
-                            continue;
-                        }
-
-                        const uint8_t* cptr = fdata + abs_off;
-                        if (pack_buf.empty() &&
-                            (span_len == 0u || (span_ptr + span_len == cptr && span_len + rc_rel.length <= ASZ_LARGE_PACK_MAX))) {
-                            if (span_len == 0u) span_ptr = cptr;
-                            uint32_t cid = (uint32_t)chunks.size();
-                            AszChunkDesc cd = { (uint32_t)packs.size(), span_len, rc_rel.length,
-                                                rc_rel.key.crc32c, rc_rel.key.hash_lo, rc_rel.key.hash_hi };
-                            chunks.push_back(cd);
-                            chunk_map.emplace(rc_rel.key, cid);
-                            extents.push_back({ cid, 0u, rc_rel.length, 0u });
-                            span_len += rc_rel.length;
-                            stats.unique_raw_bytes += rc_rel.length;
-                            stats.num_chunks_unique++;
-
-                            if (span_len >= ASZ_LARGE_PACK_MAX) {
-                                if (!flush_span_direct()) { munmap(m, fsize); close(fd); return abort_out(); }
-                            }
-                            continue;
-                        }
-
-                        if (span_len > 0u) {
-                            if (!flush_span_direct()) { munmap(m, fsize); close(fd); return abort_out(); }
-                            if (pack_buf.empty() && rc_rel.length <= ASZ_LARGE_PACK_MAX) {
-                                span_ptr = cptr;
-                                uint32_t cid = (uint32_t)chunks.size();
-                                AszChunkDesc cd = { (uint32_t)packs.size(), 0u, rc_rel.length,
-                                                    rc_rel.key.crc32c, rc_rel.key.hash_lo, rc_rel.key.hash_hi };
-                                chunks.push_back(cd);
-                                chunk_map.emplace(rc_rel.key, cid);
-                                extents.push_back({ cid, 0u, rc_rel.length, 0u });
-                                span_len = rc_rel.length;
-                                stats.unique_raw_bytes += rc_rel.length;
-                                stats.num_chunks_unique++;
+                        stats.num_chunks_unique++;
+                        stats.unique_raw_bytes += flen;
+                    }
+                    if (!submit_pack_owned(std::move(owned_batch), (uint32_t)cur_o, cls, false, true))
+                        return abort_out();
+                } else {
+                    for (size_t k = 0u; k < bc; ++k) {
+                        uint32_t idx = med_idxs[mi + k];
+                        const uint8_t* fptr = bbuf_p + foffs[k];
+                        entries[idx].first_extent = (uint32_t)extents.size();
+                        uint32_t file_crc = 0u;
+                        for (const AszRawChunkSlice& rc : batch_chunks[k]) {
+                            file_crc = hx_crc32c_combine(file_crc, rc.key.crc32c, rc.length);
+                            stats.num_chunks_total++;
+                            auto mit = chunk_map.find(rc.key);
+                            if (mit != chunk_map.end()) {
+                                extents.push_back({ mit->second, 0u, rc.length, 0u });
+                                stats.dedup_saved_bytes += rc.length;
                                 continue;
                             }
-                        }
-                        if (!pack_buf.empty() && pack_buf.size() + rc_rel.length + 4u > ASZ_LARGE_PACK_MAX) {
-                            if (!write_compressed_pack(pack_buf.data(), (uint32_t)pack_buf.size(), cls, false)) {
-                                munmap(m, fsize); close(fd); return abort_out();
+                            if (pbuf_used > 0u && pbuf_used + rc.length + 4u > MED_PACK_FLUSH) {
+                                if (!flush_pbuf()) return abort_out();
                             }
-                            pack_buf.clear();
+                            ensure_pbuf();
+                            if (cls == ASZ_CLASS_CODE || cls == ASZ_CLASS_NUMERIC) {
+                                uint32_t want_align = (uint32_t)(rc.offset & 3u);
+                                while ((pbuf_used & 3u) != want_align) pbuf->data()[pbuf_used++] = 0u;
+                            }
+                            uint32_t cid = (uint32_t)chunks.size();
+                            uint32_t off = pbuf_used;
+                            memcpy(pbuf->data() + pbuf_used, fptr + rc.offset, rc.length);
+                            pbuf_used += rc.length;
+                            chunks.push_back({ next_pack_id, off, rc.length,
+                                               rc.key.crc32c, rc.key.hash_lo, rc.key.hash_hi });
+                            chunk_map.emplace(rc.key, cid);
+                            extents.push_back({ cid, 0u, rc.length, 0u });
+                            stats.unique_raw_bytes += rc.length;
+                            stats.num_chunks_unique++;
                         }
-                        if (cls == ASZ_CLASS_CODE || cls == ASZ_CLASS_NUMERIC) {
-                            uint32_t want_align = (uint32_t)(abs_off & 3u);
-                            while ((pack_buf.size() & 3u) != want_align) pack_buf.push_back(0u);
-                        }
-                        uint32_t cid = (uint32_t)chunks.size();
-                        uint32_t off = (uint32_t)pack_buf.size();
-                        pack_buf.insert(pack_buf.end(), cptr, cptr + rc_rel.length);
-                        AszChunkDesc cd = { (uint32_t)packs.size(), off, rc_rel.length,
-                                            rc_rel.key.crc32c, rc_rel.key.hash_lo, rc_rel.key.hash_hi };
-                        chunks.push_back(cd);
-                        chunk_map.emplace(rc_rel.key, cid);
-                        extents.push_back({ cid, 0u, rc_rel.length, 0u });
-                        stats.unique_raw_bytes += rc_rel.length;
-                        stats.num_chunks_unique++;
-                    }
-
-                    // ウィンドウ境界: 2 GiB 超の超巨大ファイルのみ完了済みページを解放
-                    if (fsize >= 2048ull * 1024ull * 1024ull) {
-                        if (span_len >= 4u * 1024u * 1024u) {
-                            if (!flush_span_direct()) { munmap(m, fsize); close(fd); return abort_out(); }
-                        } else if (span_len > 0u) {
-                            materialize_span();
-                        }
-                        asz_madvise_dontneed(fdata, win_off, win_off + win_len);
+                        entries[idx].file_crc32c = file_crc;
+                        entries[idx].num_extents = (uint32_t)extents.size() - entries[idx].first_extent;
                     }
                 }
+                mi = mj;
+            }
 
-                entries[idx].file_crc32c = file_crc;
+            // ── (B2) 巨大ファイル群 (>= 16 MiB): 複数ファイル横断 8 MiB 並列 F_RDADVISE + FastCDC ──
+            if (!huge_idxs.empty()) {
+                if (!opts.enable_dedup) {
+                    if (!flush_pbuf()) return abort_out();
+                    for (uint32_t idx : huge_idxs) {
+                        const ScanItem& it = items[idx];
+                        const size_t fsize = (size_t)it.raw_size;
+                        int fd = open(it.src_path.c_str(), O_RDONLY);
+                        if (fd < 0) { last_error = "Cannot open file: " + it.src_path; return abort_out(); }
+                        void* m = mmap(nullptr, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+                        if (m == MAP_FAILED) { close(fd); last_error = "mmap failed: " + it.src_path; return abort_out(); }
+                        auto mg = std::make_shared<AszMappedFileGuard>(m, fsize, fd);
+                        const uint8_t* fdata = (const uint8_t*)m;
 
-                // ファイル終端: munmap 前に span_ptr を確実にフラッシュ/退避
-                if (span_len >= 4u * 1024u * 1024u || idxs.size() == 1u) {
-                    if (!flush_span_direct()) { munmap(m, fsize); close(fd); return abort_out(); }
-                } else if (span_len > 0u) {
-                    materialize_span();
+                        entries[idx].first_extent = (uint32_t)extents.size();
+                        entries[idx].file_crc32c  = 0u;
+                        size_t foff = 0u;
+                        while (foff < fsize) {
+                            uint32_t slen = (uint32_t)std::min((size_t)ASZ_STREAM_PACK_MAX, fsize - foff);
+                            const size_t n_adv = (slen + 16u * 1024u * 1024u - 1u) / (16u * 1024u * 1024u);
+                            dispatch_apply(n_adv, par_q, ^(size_t ai) {
+                                uint64_t aoff = (uint64_t)foff + (uint64_t)ai * 16ull * 1024ull * 1024ull;
+                                uint64_t alen = std::min(16ull * 1024ull * 1024ull, (uint64_t)(foff + slen) - aoff);
+                                hx_advise_read_fd(fd, aoff, alen);
+                            });
+                            uint32_t pid = next_pack_id;
+                            uint32_t cid = (uint32_t)chunks.size();
+                            chunks.push_back({ pid, 0u, slen, 0u, 0ULL, 0ULL });
+                            extents.push_back({ cid, 0u, slen, 0u });
+                            if (!submit_pack_mapped(mg, fdata + foff, slen, cls, cid, idx)) return abort_out();
+                            stats.num_chunks_total++;
+                            stats.num_chunks_unique++;
+                            stats.unique_raw_bytes += slen;
+                            foff += slen;
+                        }
+                        entries[idx].num_extents = (uint32_t)extents.size() - entries[idx].first_extent;
+                    }
+                } else {
+                    // 重複排除 ON: 複数ファイル (< 128 MiB) を最大 128 MiB ウィンドウへ束ねて全 10 コア並列 F_RDADVISE+FastCDC!
+                    const size_t WIN_BYTES = (size_t)ASZ_LARGE_PACK_MAX;
+                    const size_t SLICE_B   = 8ull * 1024ull * 1024ull;
+
+                    struct HugeOpen {
+                        uint32_t idx;
+                        std::shared_ptr<AszMappedFileGuard> mg;
+                        const uint8_t* fdata;
+                        size_t fsize;
+                    };
+                    struct HugeSliceJob {
+                        uint32_t file_k;
+                        int      fd;
+                        const uint8_t* fdata;
+                        size_t   base;
+                        size_t   end;
+                    };
+
+                    size_t hi = 0u;
+                    while (hi < huge_idxs.size()) {
+                        std::vector<HugeOpen> grp;
+                        size_t grp_bytes = 0u;
+                        while (hi < huge_idxs.size()) {
+                            uint64_t fsz = items[huge_idxs[hi]].raw_size;
+                            if (!grp.empty() && grp_bytes + fsz > WIN_BYTES) break;
+                            uint32_t idx = huge_idxs[hi];
+                            const ScanItem& it = items[idx];
+                            int fd = open(it.src_path.c_str(), O_RDONLY);
+                            if (fd < 0) { last_error = "Cannot open file: " + it.src_path; return abort_out(); }
+                            void* m = mmap(nullptr, (size_t)fsz, PROT_READ, MAP_PRIVATE, fd, 0);
+                            if (m == MAP_FAILED) { close(fd); last_error = "mmap failed: " + it.src_path; return abort_out(); }
+                            grp.push_back({ idx, std::make_shared<AszMappedFileGuard>(m, (size_t)fsz, fd),
+                                            (const uint8_t*)m, (size_t)fsz });
+                            grp_bytes += (size_t)fsz;
+                            hi++;
+                            if (fsz >= WIN_BYTES) break;
+                        }
+
+                        if (grp.size() == 1u && grp[0].fsize > WIN_BYTES) {
+                            auto& ho = grp[0];
+                            uint32_t idx = ho.idx;
+                            entries[idx].first_extent = (uint32_t)extents.size();
+                            uint32_t file_crc = 0u;
+                            const uint8_t* span_ptr = nullptr;
+                            uint32_t       span_len = 0u;
+
+                            auto flush_span = [&]() -> bool {
+                                if (span_len == 0u) return true;
+                                bool ok = submit_pack_mapped(ho.mg, span_ptr, span_len, cls);
+                                span_ptr = nullptr; span_len = 0u;
+                                return ok;
+                            };
+                            auto mat_span = [&]() {
+                                if (span_len == 0u) return;
+                                ensure_pbuf();
+                                memcpy(pbuf->data() + pbuf_used, span_ptr, span_len);
+                                pbuf_used += span_len;
+                                span_ptr = nullptr; span_len = 0u;
+                            };
+
+                            for (size_t win_off = 0u; win_off < ho.fsize; win_off += WIN_BYTES) {
+                                size_t win_len = std::min(WIN_BYTES, ho.fsize - win_off);
+                                asz_fastcdc_chunk_and_hash(ho.fdata + win_off, win_len, true, raw_chunks, ho.mg->fd, (uint64_t)win_off);
+
+                                for (const AszRawChunkSlice& rc_rel : raw_chunks) {
+                                    const size_t abs_off = win_off + rc_rel.offset;
+                                    file_crc = hx_crc32c_combine(file_crc, rc_rel.key.crc32c, rc_rel.length);
+                                    stats.num_chunks_total++;
+
+                                    auto mit = chunk_map.find(rc_rel.key);
+                                    if (mit != chunk_map.end()) {
+                                        extents.push_back({ mit->second, 0u, rc_rel.length, 0u });
+                                        stats.dedup_saved_bytes += rc_rel.length;
+                                        if (span_len >= 8u * 1024u * 1024u) {
+                                            if (!flush_span()) return abort_out();
+                                        } else if (span_len > 0u) {
+                                            mat_span();
+                                        }
+                                        continue;
+                                    }
+
+                                    const uint8_t* cptr = ho.fdata + abs_off;
+                                    if (pbuf_used == 0u &&
+                                        (span_len == 0u || (span_ptr + span_len == cptr && span_len + rc_rel.length <= ASZ_LARGE_PACK_MAX))) {
+                                        if (span_len == 0u) span_ptr = cptr;
+                                        uint32_t cid = (uint32_t)chunks.size();
+                                        chunks.push_back({ next_pack_id, span_len, rc_rel.length,
+                                                           rc_rel.key.crc32c, rc_rel.key.hash_lo, rc_rel.key.hash_hi });
+                                        chunk_map.emplace(rc_rel.key, cid);
+                                        extents.push_back({ cid, 0u, rc_rel.length, 0u });
+                                        span_len += rc_rel.length;
+                                        stats.unique_raw_bytes += rc_rel.length;
+                                        stats.num_chunks_unique++;
+                                        if (span_len >= ASZ_LARGE_PACK_MAX) {
+                                            if (!flush_span()) return abort_out();
+                                        }
+                                        continue;
+                                    }
+                                    if (span_len > 0u) {
+                                        if (!flush_span()) return abort_out();
+                                        if (pbuf_used == 0u && rc_rel.length <= ASZ_LARGE_PACK_MAX) {
+                                            span_ptr = cptr;
+                                            uint32_t cid = (uint32_t)chunks.size();
+                                            chunks.push_back({ next_pack_id, 0u, rc_rel.length,
+                                                               rc_rel.key.crc32c, rc_rel.key.hash_lo, rc_rel.key.hash_hi });
+                                            chunk_map.emplace(rc_rel.key, cid);
+                                            extents.push_back({ cid, 0u, rc_rel.length, 0u });
+                                            span_len = rc_rel.length;
+                                            stats.unique_raw_bytes += rc_rel.length;
+                                            stats.num_chunks_unique++;
+                                            continue;
+                                        }
+                                    }
+                                    if (pbuf_used > 0u && pbuf_used + rc_rel.length + 4u > ASZ_LARGE_PACK_MAX) {
+                                        if (!flush_pbuf()) return abort_out();
+                                    }
+                                    ensure_pbuf();
+                                    if (cls == ASZ_CLASS_CODE || cls == ASZ_CLASS_NUMERIC) {
+                                        uint32_t want_align = (uint32_t)(abs_off & 3u);
+                                        while ((pbuf_used & 3u) != want_align) pbuf->data()[pbuf_used++] = 0u;
+                                    }
+                                    uint32_t cid = (uint32_t)chunks.size();
+                                    uint32_t off = pbuf_used;
+                                    memcpy(pbuf->data() + pbuf_used, cptr, rc_rel.length);
+                                    pbuf_used += rc_rel.length;
+                                    chunks.push_back({ next_pack_id, off, rc_rel.length,
+                                                       rc_rel.key.crc32c, rc_rel.key.hash_lo, rc_rel.key.hash_hi });
+                                    chunk_map.emplace(rc_rel.key, cid);
+                                    extents.push_back({ cid, 0u, rc_rel.length, 0u });
+                                    stats.unique_raw_bytes += rc_rel.length;
+                                    stats.num_chunks_unique++;
+                                }
+                            }
+                            entries[idx].file_crc32c = file_crc;
+                            if (span_len >= 4u * 1024u * 1024u || huge_idxs.size() == 1u) {
+                                if (!flush_span()) return abort_out();
+                            } else if (span_len > 0u) {
+                                mat_span();
+                            }
+                            entries[idx].num_extents = (uint32_t)extents.size() - entries[idx].first_extent;
+                            continue;
+                        }
+
+                        // 複数ファイル群 (16..128 MiB): 全ファイルの 8 MiB スライスを 1 回の dispatch_apply で並列実行!
+                        std::vector<HugeSliceJob> sjobs;
+                        std::vector<size_t> file_slice_first(grp.size());
+                        std::vector<size_t> file_slice_cnt(grp.size());
+                        for (uint32_t fk = 0u; fk < (uint32_t)grp.size(); ++fk) {
+                            file_slice_first[fk] = sjobs.size();
+                            size_t n_sl = (grp[fk].fsize + SLICE_B - 1u) / SLICE_B;
+                            file_slice_cnt[fk] = n_sl;
+                            for (size_t si = 0u; si < n_sl; ++si) {
+                                size_t b = si * SLICE_B;
+                                size_t e = std::min(grp[fk].fsize, b + SLICE_B);
+                                sjobs.push_back({ fk, grp[fk].mg->fd, grp[fk].fdata, b, e });
+                            }
+                        }
+
+                        std::vector<std::vector<AszRawChunkSlice>> slice_out(sjobs.size());
+                        const HugeSliceJob* sj_p = sjobs.data();
+                        auto* so_p = slice_out.data();
+                        dispatch_apply(sjobs.size(), par_q, ^(size_t sj_i) {
+                            const HugeSliceJob& sj = sj_p[sj_i];
+                            hx_advise_read_fd(sj.fd, (uint64_t)sj.base, (uint64_t)(sj.end - sj.base));
+                            auto& local = so_p[sj_i];
+                            local.reserve((sj.end - sj.base) / 48000u + 4u);
+                            size_t pos = sj.base;
+                            while (pos < sj.end) {
+                                uint32_t cut = asz_fastcdc_next_cut(sj.fdata + pos, sj.end - pos);
+                                AszChunkKey key = asz_fingerprint_chunk(sj.fdata + pos, cut);
+                                local.push_back({ pos, cut, key });
+                                pos += cut;
+                            }
+                        });
+
+                        // 決定論的順序で dedup & ゼロコピー非同期投入!
+                        for (uint32_t fk = 0u; fk < (uint32_t)grp.size(); ++fk) {
+                            auto& ho = grp[fk];
+                            uint32_t idx = ho.idx;
+                            entries[idx].first_extent = (uint32_t)extents.size();
+                            uint32_t file_crc = 0u;
+                            const uint8_t* span_ptr = nullptr;
+                            uint32_t       span_len = 0u;
+
+                            auto flush_span = [&]() -> bool {
+                                if (span_len == 0u) return true;
+                                bool ok = submit_pack_mapped(ho.mg, span_ptr, span_len, cls);
+                                span_ptr = nullptr; span_len = 0u;
+                                return ok;
+                            };
+                            auto mat_span = [&]() {
+                                if (span_len == 0u) return;
+                                ensure_pbuf();
+                                memcpy(pbuf->data() + pbuf_used, span_ptr, span_len);
+                                pbuf_used += span_len;
+                                span_ptr = nullptr; span_len = 0u;
+                            };
+
+                            size_t s0 = file_slice_first[fk];
+                            size_t sc = file_slice_cnt[fk];
+                            for (size_t si = 0u; si < sc; ++si) {
+                                for (const AszRawChunkSlice& rc : slice_out[s0 + si]) {
+                                    file_crc = hx_crc32c_combine(file_crc, rc.key.crc32c, rc.length);
+                                    stats.num_chunks_total++;
+
+                                    auto mit = chunk_map.find(rc.key);
+                                    if (mit != chunk_map.end()) {
+                                        extents.push_back({ mit->second, 0u, rc.length, 0u });
+                                        stats.dedup_saved_bytes += rc.length;
+                                        if (span_len >= 8u * 1024u * 1024u) {
+                                            if (!flush_span()) return abort_out();
+                                        } else if (span_len > 0u) {
+                                            mat_span();
+                                        }
+                                        continue;
+                                    }
+
+                                    const uint8_t* cptr = ho.fdata + rc.offset;
+                                    if (pbuf_used == 0u &&
+                                        (span_len == 0u || (span_ptr + span_len == cptr && span_len + rc.length <= ASZ_LARGE_PACK_MAX))) {
+                                        if (span_len == 0u) span_ptr = cptr;
+                                        uint32_t cid = (uint32_t)chunks.size();
+                                        chunks.push_back({ next_pack_id, span_len, rc.length,
+                                                           rc.key.crc32c, rc.key.hash_lo, rc.key.hash_hi });
+                                        chunk_map.emplace(rc.key, cid);
+                                        extents.push_back({ cid, 0u, rc.length, 0u });
+                                        span_len += rc.length;
+                                        stats.unique_raw_bytes += rc.length;
+                                        stats.num_chunks_unique++;
+                                        if (span_len >= ASZ_LARGE_PACK_MAX) {
+                                            if (!flush_span()) return abort_out();
+                                        }
+                                        continue;
+                                    }
+                                    if (span_len > 0u) {
+                                        if (!flush_span()) return abort_out();
+                                        if (pbuf_used == 0u && rc.length <= ASZ_LARGE_PACK_MAX) {
+                                            span_ptr = cptr;
+                                            uint32_t cid = (uint32_t)chunks.size();
+                                            chunks.push_back({ next_pack_id, 0u, rc.length,
+                                                               rc.key.crc32c, rc.key.hash_lo, rc.key.hash_hi });
+                                            chunk_map.emplace(rc.key, cid);
+                                            extents.push_back({ cid, 0u, rc.length, 0u });
+                                            span_len = rc.length;
+                                            stats.unique_raw_bytes += rc.length;
+                                            stats.num_chunks_unique++;
+                                            continue;
+                                        }
+                                    }
+                                    if (pbuf_used > 0u && pbuf_used + rc.length + 4u > ASZ_LARGE_PACK_MAX) {
+                                        if (!flush_pbuf()) return abort_out();
+                                    }
+                                    ensure_pbuf();
+                                    if (cls == ASZ_CLASS_CODE || cls == ASZ_CLASS_NUMERIC) {
+                                        uint32_t want_align = (uint32_t)(rc.offset & 3u);
+                                        while ((pbuf_used & 3u) != want_align) pbuf->data()[pbuf_used++] = 0u;
+                                    }
+                                    uint32_t cid = (uint32_t)chunks.size();
+                                    uint32_t off = pbuf_used;
+                                    memcpy(pbuf->data() + pbuf_used, cptr, rc.length);
+                                    pbuf_used += rc.length;
+                                    chunks.push_back({ next_pack_id, off, rc.length,
+                                                       rc.key.crc32c, rc.key.hash_lo, rc.key.hash_hi });
+                                    chunk_map.emplace(rc.key, cid);
+                                    extents.push_back({ cid, 0u, rc.length, 0u });
+                                    stats.unique_raw_bytes += rc.length;
+                                    stats.num_chunks_unique++;
+                                }
+                            }
+                            entries[idx].file_crc32c = file_crc;
+                            if (span_len >= 4u * 1024u * 1024u || huge_idxs.size() == 1u) {
+                                if (!flush_span()) return abort_out();
+                            } else if (span_len > 0u) {
+                                mat_span();
+                            }
+                            entries[idx].num_extents = (uint32_t)extents.size() - entries[idx].first_extent;
+                        }
+                    }
                 }
-
-                entries[idx].num_extents = (uint32_t)extents.size() - entries[idx].first_extent;
-                munmap(m, fsize);
-                close(fd);
             }
 
-            if (!pack_buf.empty()) {
-                if (!write_compressed_pack(pack_buf.data(), (uint32_t)pack_buf.size(), cls, false))
-                    return abort_out();
-                pack_buf.clear();
-            }
+            if (!flush_pbuf()) return abort_out();
+        }
+        med_read_buf = HxRawBuf();
+
+        // 全非同期パックの圧縮・書出完了を待機し、遅延 CRC (--no-dedup 巨大ファイル) を反映
+        dispatch_group_wait(pack_grp, DISPATCH_TIME_FOREVER);
+        if (pw.failed.load(std::memory_order_acquire)) {
+            last_error = "Phase 2 HeteroEngine streaming compress failed";
+            return abort_out();
+        }
+        uint64_t file_cursor = pw.file_cursor;
+        for (const auto& dc : deferred_crcs) {
+            chunks[dc.chunk_id].crc32c = dc.crc;
+            entries[dc.entry_idx].file_crc32c = hx_crc32c_combine(entries[dc.entry_idx].file_crc32c, dc.crc, dc.slice_len);
         }
 
         // ── Phase C: セントラルディレクトリを Phase 2 圧縮して末尾へ書き出し ──────
@@ -1121,24 +1806,29 @@ public:
 
         dispatch_queue_t par_q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
 
-        // フル展開用 2 スロット Pack LRU キャッシュ (重複排除済みチャンクの多重参照で 100% ヒット!)
+        // フル展開用 6 スロット Pack LRU キャッシュ (多世代・クロスファイル重複参照のキャッシュミスを激減!)
         struct PackCacheSlot {
             uint32_t             pack_id = UINT32_MAX;
             uint64_t             lru_ts  = 0u;
             std::vector<uint8_t> data;
         };
-        PackCacheSlot cache[2];
+        static const int PACK_CACHE_SLOTS = 6;
+        PackCacheSlot cache[PACK_CACHE_SLOTS];
         uint64_t lru_clock = 0u;
 
         auto get_decoded_pack = [&](uint32_t pid) -> const std::vector<uint8_t>* {
-            for (int k = 0; k < 2; ++k) {
+            for (int k = 0; k < PACK_CACHE_SLOTS; ++k) {
                 if (cache[k].pack_id == pid) {
                     cache[k].lru_ts = ++lru_clock;
                     return &cache[k].data;
                 }
             }
-            int victim = (cache[0].lru_ts <= cache[1].lru_ts) ? 0 : 1;
+            int victim = 0;
+            for (int k = 1; k < PACK_CACHE_SLOTS; ++k) {
+                if (cache[k].lru_ts < cache[victim].lru_ts) victim = k;
+            }
             const AszPackDesc& pk = dir.packs[pid];
+            if (pk.comp_size >= 1024u * 1024u) hx_advise_read_fd(fd, pk.file_offset, pk.comp_size);
             const uint8_t* pbytes = mapped + pk.file_offset;
             if (!asz_verify_pack_stream_crc(pbytes, (size_t)pk.comp_size, pk.pack_crc32c)) {
                 last_error = "Pack CRC32C mismatch (corrupted archive)";
@@ -1402,7 +2092,8 @@ public:
                     const uint32_t       pid = ch0.pack_id;
                     const AszPackDesc&   pk  = dir.packs[pid];
 
-                    bool cached = (cache[0].pack_id == pid || cache[1].pack_id == pid);
+                    bool cached = false;
+                    for (int k = 0; k < PACK_CACHE_SLOTS; ++k) { if (cache[k].pack_id == pid) { cached = true; break; } }
                     if (!cached && ch0.offset_in_pack == 0u && ex0.offset_in_chunk == 0u &&
                         pk.raw_size >= 1024u * 1024u) {
                         uint32_t expect_off = 0u;
@@ -1415,6 +2106,7 @@ public:
                             ej++;
                         }
                         if (expect_off == pk.raw_size && pack_ext_refs[pid] == (ej - ei)) {
+                            if (pk.comp_size >= 1024u * 1024u) hx_advise_read_fd(fd, pk.file_offset, pk.comp_size);
                             const uint8_t* pb = mapped + pk.file_offset;
                             if (!asz_verify_pack_stream_crc(pb, (size_t)pk.comp_size, pk.pack_crc32c)) {
                                 last_error = "Pack CRC32C mismatch (corrupted archive)";
@@ -1563,6 +2255,7 @@ public:
             }
             int victim = (cache[0].lru_ts <= cache[1].lru_ts) ? 0 : 1;
             const AszPackDesc& pk = dir.packs[pid];
+            if (pk.comp_size >= 1024u * 1024u) hx_advise_read_fd(fd, pk.file_offset, pk.comp_size);
             const uint8_t* pb = mapped + pk.file_offset;
             if (!asz_verify_pack_stream_crc(pb, (size_t)pk.comp_size, pk.pack_crc32c)) {
                 last_error = "Pack CRC32C mismatch"; return nullptr;
@@ -1611,6 +2304,7 @@ public:
                         }
                     }
                     if (!reused_later) {
+                        if (pk.comp_size >= 1024u * 1024u) hx_advise_read_fd(fd, pk.file_offset, pk.comp_size);
                         const uint8_t* pb = mapped + pk.file_offset;
                         if (!asz_verify_pack_stream_crc(pb, (size_t)pk.comp_size, pk.pack_crc32c)) {
                             last_error = "Pack CRC32C mismatch";
@@ -1694,7 +2388,8 @@ public:
         dispatch_queue_t par_q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
         AszExtractStats stats;
         struct PackCacheSlot { uint32_t pack_id = UINT32_MAX; uint64_t lru_ts = 0u; std::vector<uint8_t> data; };
-        PackCacheSlot cache[2];
+        static const int VFY_CACHE_SLOTS = 6;
+        PackCacheSlot cache[VFY_CACHE_SLOTS];
         uint64_t lru_clock = 0u;
         std::vector<uint8_t> pack_verified(dir.packs.size(), 0u);
         std::vector<uint32_t> pack_ext_refs(dir.packs.size(), 0u);
@@ -1706,11 +2401,15 @@ public:
         }
 
         auto get_pack = [&](uint32_t pid) -> const std::vector<uint8_t>* {
-            for (int k = 0; k < 2; ++k) {
+            for (int k = 0; k < VFY_CACHE_SLOTS; ++k) {
                 if (cache[k].pack_id == pid) { cache[k].lru_ts = ++lru_clock; return &cache[k].data; }
             }
-            int victim = (cache[0].lru_ts <= cache[1].lru_ts) ? 0 : 1;
+            int victim = 0;
+            for (int k = 1; k < VFY_CACHE_SLOTS; ++k) {
+                if (cache[k].lru_ts < cache[victim].lru_ts) victim = k;
+            }
             const AszPackDesc& pk = dir.packs[pid];
+            if (pk.comp_size >= 1024u * 1024u) hx_advise_read_fd(fd, pk.file_offset, pk.comp_size);
             const uint8_t* pb = mapped + pk.file_offset;
             if (!asz_verify_pack_stream_crc(pb, (size_t)pk.comp_size, pk.pack_crc32c)) {
                 last_error = "Pack CRC32C mismatch"; return nullptr;
@@ -1756,11 +2455,13 @@ public:
                 const AszPackDesc&   pk  = dir.packs[pid];
 
                 // 非共有の単一フルチャンク Pack はゼロメモリ確保のストリーミング検証!
-                bool cached = (cache[0].pack_id == pid || cache[1].pack_id == pid);
+                bool cached = false;
+                for (int k = 0; k < VFY_CACHE_SLOTS; ++k) { if (cache[k].pack_id == pid) { cached = true; break; } }
                 if (!cached && pack_ext_refs[pid] == 1u &&
                     ch0.offset_in_pack == 0u && ex0.offset_in_chunk == 0u &&
                     ex0.length == pk.raw_size && ch0.raw_size == pk.raw_size &&
                     pk.raw_size >= 1024u * 1024u) {
+                    if (pk.comp_size >= 1024u * 1024u) hx_advise_read_fd(fd, pk.file_offset, pk.comp_size);
                     const uint8_t* pb = mapped + pk.file_offset;
                     if (!asz_verify_pack_stream_crc(pb, (size_t)pk.comp_size, pk.pack_crc32c)) {
                         last_error = "Pack CRC32C mismatch"; ok = false; break;
